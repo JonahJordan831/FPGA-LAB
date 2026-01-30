@@ -1,0 +1,265 @@
+`timescale 1ns / 1ps
+module top (
+    input clk,              // 100MHz Basys 3
+    input BTNU,             // Up button
+    input BTNL,             // Down button (physically down, labeled left)
+    input BTNR,             // Left button (physically left, labeled right)
+    input BTNC,             // Right button (physically right, labeled center)
+    input BTND,             // Center button - color change (physically center, labeled down)
+    output reg Hsync,
+    output reg Vsync,
+    output reg [3:0] Red,
+    output reg [3:0] Green,
+    output reg [3:0] Blue
+);
+    // Clock divider - generate enable pulse every 4 clocks
+    reg [1:0] clk_count = 0;
+    wire pixel_tick = (clk_count == 2'd0);
+    
+    always @(posedge clk) begin
+        clk_count <= clk_count + 1;
+    end
+    
+    // Counters
+    reg [9:0] hcnt = 0;
+    reg [9:0] vcnt = 0;
+    
+    always @(posedge clk) begin
+        if (pixel_tick) begin
+            if (hcnt == 799) begin
+                hcnt <= 0;
+                if (vcnt == 524) begin
+                    vcnt <= 0;
+                end else begin
+                    vcnt <= vcnt + 1;
+                end
+            end else begin
+                hcnt <= hcnt + 1;
+            end
+        end
+    end
+    
+    // Generate sync signals
+    always @(posedge clk) begin
+        Hsync <= ~((hcnt >= 656) && (hcnt < 752));
+        Vsync <= ~((vcnt >= 490) && (vcnt < 492));
+    end
+    
+    // Double T pattern stored in register (9 bits per row, 10 rows)
+    reg [8:0] logo_pattern [0:9];
+    initial begin
+        logo_pattern[0] = 9'b111111111;
+        logo_pattern[1] = 9'b100010001;
+        logo_pattern[2] = 9'b100010001;
+        logo_pattern[3] = 9'b000010000;
+        logo_pattern[4] = 9'b001111100;
+        logo_pattern[5] = 9'b001010100;
+        logo_pattern[6] = 9'b000010000;
+        logo_pattern[7] = 9'b000010000;
+        logo_pattern[8] = 9'b000010000;
+        logo_pattern[9] = 9'b000111000;
+    end
+    
+    // Scale factor and logo dimensions
+    parameter SCALE = 8;
+    parameter LOGO_WIDTH = 9 * SCALE;   // 72 pixels
+    parameter LOGO_HEIGHT = 10 * SCALE;  // 80 pixels
+    parameter PLAYER_SIZE = 8;          // 8x8 pixel player sprite
+    
+    // Movement speed divider for bouncing logo
+    reg [19:0] move_counter = 0;
+    wire move_tick = (move_counter == 20'd833332);  // ~30 updates per second
+    
+    always @(posedge clk) begin
+        if (move_tick) begin
+            move_counter <= 0;
+        end else begin
+            move_counter <= move_counter + 1;
+        end
+    end
+    
+    // Logo position and velocity
+    reg signed [10:0] logo_x = 284;  // Start centered
+    reg signed [10:0] logo_y = 200;
+    reg signed [2:0] vel_x = 2;      // Velocity in pixels per frame
+    reg signed [2:0] vel_y = 2;
+    
+    // Logo bounce logic
+    always @(posedge clk) begin
+        if (move_tick) begin
+            // Update position
+            logo_x <= logo_x + vel_x;
+            logo_y <= logo_y + vel_y;
+            
+            // Bounce off left/right walls
+            if ((logo_x + vel_x) <= 0) begin
+                vel_x <= 2;  // Bounce right
+            end else if ((logo_x + vel_x + LOGO_WIDTH) >= 640) begin
+                vel_x <= -2; // Bounce left
+            end
+            
+            // Bounce off top/bottom walls
+            if ((logo_y + vel_y) <= 0) begin
+                vel_y <= 2;  // Bounce down
+            end else if ((logo_y + vel_y + LOGO_HEIGHT) >= 480) begin
+                vel_y <= -2; // Bounce up
+            end
+        end
+    end
+    
+    // Button debouncing and edge detection
+    reg [19:0] btn_counter = 0;
+    wire btn_tick = (btn_counter == 20'd1666666);  // ~60Hz button polling
+    
+    always @(posedge clk) begin
+        if (btn_tick) begin
+            btn_counter <= 0;
+        end else begin
+            btn_counter <= btn_counter + 1;
+        end
+    end
+    
+    reg BTNU_prev = 0, BTNL_prev = 0, BTNR_prev = 0, BTNC_prev = 0, BTND_prev = 0;
+    reg BTNU_sync = 0, BTNL_sync = 0, BTNR_sync = 0, BTNC_sync = 0, BTND_sync = 0;
+    
+    always @(posedge clk) begin
+        if (btn_tick) begin
+            BTNU_sync <= BTNU;
+            BTNL_sync <= BTNL;
+            BTNR_sync <= BTNR;
+            BTNC_sync <= BTNC;
+            BTND_sync <= BTND;
+            
+            BTNU_prev <= BTNU_sync;
+            BTNL_prev <= BTNL_sync;
+            BTNR_prev <= BTNR_sync;
+            BTNC_prev <= BTNC_sync;
+            BTND_prev <= BTND_sync;
+        end
+    end
+    
+    // Player position
+    reg [9:0] player_x = 50;   // Start top-left area
+    reg [9:0] player_y = 50;
+    
+    // Player color selection (0=Green, 1=Blue, 2=Yellow, 3=Cyan, 4=Magenta, 5=White)
+    reg [2:0] player_color = 0;
+    
+    // Detect center button press (edge detection) - using BTND now
+    wire btnc_pressed = BTND_sync && !BTND_prev;
+    
+    // Player movement and color change
+    always @(posedge clk) begin
+        if (btn_tick) begin
+            // Move up - BTNU
+            if (BTNU_sync && (player_y > 0)) begin
+                player_y <= player_y - 2;
+            end
+            // Move down - BTNL (physically down button)
+            if (BTNL_sync && (player_y < (480 - PLAYER_SIZE))) begin
+                player_y <= player_y + 2;
+            end
+            // Move left - BTNR (physically left button)
+            if (BTNR_sync && (player_x > 0)) begin
+                player_x <= player_x - 2;
+            end
+            // Move right - BTNC (physically right button)
+            if (BTNC_sync && (player_x < (640 - PLAYER_SIZE))) begin
+                player_x <= player_x + 2;
+            end
+            
+            // Change color on center button press - BTND (physically center button)
+            if (btnc_pressed) begin
+                if (player_color == 5) begin
+                    player_color <= 0;
+                end else begin
+                    player_color <= player_color + 1;
+                end
+            end
+        end
+    end
+    
+    // Calculate position within logo
+    wire signed [10:0] rel_x = hcnt - logo_x;
+    wire signed [10:0] rel_y = vcnt - logo_y;
+    wire in_logo_region = (rel_x >= 0) && (rel_x < LOGO_WIDTH) &&
+                          (rel_y >= 0) && (rel_y < LOGO_HEIGHT);
+    
+    // Get the pixel position in the original 9x10 pattern
+    wire [3:0] pattern_x = rel_x / SCALE;  // 0-8
+    wire [3:0] pattern_y = rel_y / SCALE;  // 0-9
+    
+    // Look up pixel in pattern register
+    wire logo_pixel = in_logo_region && logo_pattern[pattern_y][8 - pattern_x];
+    
+    // Check if current pixel is the player
+    wire player_pixel = (hcnt >= player_x) && (hcnt < player_x + PLAYER_SIZE) &&
+                        (vcnt >= player_y) && (vcnt < player_y + PLAYER_SIZE);
+    
+    // Player color lookup
+    reg [3:0] player_r, player_g, player_b;
+    always @(*) begin
+        case (player_color)
+            3'd0: begin // Green
+                player_r = 4'h0;
+                player_g = 4'hF;
+                player_b = 4'h0;
+            end
+            3'd1: begin // Blue
+                player_r = 4'h0;
+                player_g = 4'h0;
+                player_b = 4'hF;
+            end
+            3'd2: begin // Yellow
+                player_r = 4'hF;
+                player_g = 4'hF;
+                player_b = 4'h0;
+            end
+            3'd3: begin // Cyan
+                player_r = 4'h0;
+                player_g = 4'hF;
+                player_b = 4'hF;
+            end
+            3'd4: begin // Magenta
+                player_r = 4'hF;
+                player_g = 4'h0;
+                player_b = 4'hF;
+            end
+            3'd5: begin // White
+                player_r = 4'hF;
+                player_g = 4'hF;
+                player_b = 4'hF;
+            end
+            default: begin // Green
+                player_r = 4'h0;
+                player_g = 4'hF;
+                player_b = 4'h0;
+            end
+        endcase
+    end
+    
+    // Generate color outputs
+    wire video_on = (hcnt < 640) && (vcnt < 480);
+    
+    always @(posedge clk) begin
+        if (video_on) begin
+            if (player_pixel) begin
+                Red   <= player_r;
+                Green <= player_g;
+                Blue  <= player_b;
+            end else if (logo_pixel) begin
+                Red   <= 4'hF;  // Red logo
+                Green <= 4'h0;
+                Blue  <= 4'h0;
+            end else begin
+                Red   <= 4'h0;  // Black background
+                Green <= 4'h0;
+                Blue  <= 4'h0;
+            end
+        end else begin
+            Red   <= 4'h0;  // Blanking
+            Green <= 4'h0;
+            Blue  <= 4'h0;
+        end
+    end
+endmodule
