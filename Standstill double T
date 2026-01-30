@@ -1,0 +1,104 @@
+`timescale 1ns / 1ps
+module top (
+    input clk,              // 100MHz Basys 3
+    output reg Hsync,
+    output reg Vsync,
+    output reg [3:0] Red,
+    output reg [3:0] Green,
+    output reg [3:0] Blue
+);
+    // Clock divider - generate enable pulse every 4 clocks
+    reg [1:0] clk_count = 0;
+    wire pixel_tick = (clk_count == 2'd0);
+    
+    always @(posedge clk) begin
+        clk_count <= clk_count + 1;
+    end
+    
+    // Counters
+    reg [9:0] hcnt = 0;
+    reg [9:0] vcnt = 0;
+    
+    always @(posedge clk) begin
+        if (pixel_tick) begin
+            if (hcnt == 799) begin
+                hcnt <= 0;
+                if (vcnt == 524) begin
+                    vcnt <= 0;
+                end else begin
+                    vcnt <= vcnt + 1;
+                end
+            end else begin
+                hcnt <= hcnt + 1;
+            end
+        end
+    end
+    
+    // Generate sync signals
+    always @(posedge clk) begin
+        Hsync <= ~((hcnt >= 656) && (hcnt < 752));
+        Vsync <= ~((vcnt >= 490) && (vcnt < 492));
+    end
+    
+    // Double T pattern (9 wide x 10 tall)
+    // Scale factor for visibility (each pixel becomes 8x8 block)
+    parameter SCALE = 8;
+    parameter LOGO_WIDTH = 9 * SCALE;   // 72 pixels
+    parameter LOGO_HEIGHT = 10 * SCALE;  // 80 pixels
+    
+    // Center position
+    parameter H_CENTER = 320;  // 640/2
+    parameter V_CENTER = 240;  // 480/2
+    parameter H_START = H_CENTER - (LOGO_WIDTH / 2);   // 284
+    parameter V_START = V_CENTER - (LOGO_HEIGHT / 2);  // 200
+    
+    // Calculate position within logo
+    wire [9:0] logo_x = hcnt - H_START;
+    wire [9:0] logo_y = vcnt - V_START;
+    wire in_logo_region = (hcnt >= H_START) && (hcnt < H_START + LOGO_WIDTH) &&
+                          (vcnt >= V_START) && (vcnt < V_START + LOGO_HEIGHT);
+    
+    // Get the pixel position in the original 9x10 pattern
+    wire [3:0] pattern_x = logo_x / SCALE;  // 0-8
+    wire [3:0] pattern_y = logo_y / SCALE;  // 0-9
+    
+    // Double T pattern lookup
+    reg pixel_on;
+    always @(*) begin
+        case (pattern_y)
+            4'd0: pixel_on = (pattern_x == 0 || pattern_x == 1 || pattern_x == 2 || pattern_x == 3 || pattern_x == 4 || pattern_x == 5 || pattern_x == 6 || pattern_x == 7 || pattern_x == 8); // 111111111
+            4'd1: pixel_on = (pattern_x == 0 || pattern_x == 4 || pattern_x == 8); // 100010001
+            4'd2: pixel_on = (pattern_x == 0 || pattern_x == 4 || pattern_x == 8); // 100010001
+            4'd3: pixel_on = (pattern_x == 4); // 000010000
+            4'd4: pixel_on = (pattern_x == 2 || pattern_x == 3 || pattern_x == 4 || pattern_x == 5 || pattern_x == 6); // 001111100
+            4'd5: pixel_on = (pattern_x == 2 || pattern_x == 4 || pattern_x == 6); // 001010100
+            4'd6: pixel_on = (pattern_x == 4); // 000010000
+            4'd7: pixel_on = (pattern_x == 4); // 000010000
+            4'd8: pixel_on = (pattern_x == 4); // 000010000
+            4'd9: pixel_on = (pattern_x == 3 || pattern_x == 4 || pattern_x == 5); // 000111000
+            default: pixel_on = 0;
+        endcase
+    end
+    
+    // Generate color outputs
+    wire video_on = (hcnt < 640) && (vcnt < 480);
+    wire show_logo = in_logo_region && pixel_on;
+    
+    always @(posedge clk) begin
+        if (video_on) begin
+            if (show_logo) begin
+                Red   <= 4'hF;  // Red logo
+                Green <= 4'h0;
+                Blue  <= 4'h0;
+            end else begin
+                Red   <= 4'h0;  // Black background
+                Green <= 4'h0;
+                Blue  <= 4'h0;
+            end
+        end else begin
+            Red   <= 4'h0;  // Blanking
+            Green <= 4'h0;
+            Blue  <= 4'h0;
+        end
+    end
+endmodule
