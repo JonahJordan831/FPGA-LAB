@@ -1,0 +1,18 @@
+`timescale 1ns / 1ps
+
+module horizontal_counter (
+    input clk_25MHz,
+    output reg v_enable = 0,
+    output reg [10:0] H_Count = 0  // 0-799
+);
+    
+    always @(posedge clk_25MHz) begin
+        if (H_Count == 799) begin
+            H_Count <= 0;
+            v_enable <= 1;
+        end else begin
+            H_Count <= H_Count + 1;
+            v_enable <= 0;
+        end
+    end
+endmodule
