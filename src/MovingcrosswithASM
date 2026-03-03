@@ -1,0 +1,214 @@
+`timescale 1ns / 1ps
+module top (
+    input  wire        clk,
+    output reg         Hsync,
+    output reg         Vsync,
+    output reg  [3:0]  Red,
+    output reg  [3:0]  Green,
+    output reg  [3:0]  Blue
+);
+    reg [3:0] rst_sr = 4'b1111;
+    wire rst = rst_sr[0];
+    always @(posedge clk) rst_sr <= {1'b0, rst_sr[3:1]};
+
+    reg [1:0] clk_div = 0;
+    wire pixel_tick = (clk_div == 2'd0);
+    always @(posedge clk) clk_div <= clk_div + 1;
+
+    reg [9:0] hcnt = 0, vcnt = 0;
+    always @(posedge clk) begin
+        if (pixel_tick) begin
+            if (hcnt == 799) begin hcnt <= 0; vcnt <= (vcnt==524)?0:vcnt+1; end
+            else hcnt <= hcnt + 1;
+        end
+    end
+    wire vsync_active = (vcnt >= 490) && (vcnt < 492);
+    always @(posedge clk) begin
+        Hsync <= ~((hcnt>=656)&&(hcnt<752));
+        Vsync <= ~vsync_active;
+    end
+    wire video_on = (hcnt < 640) && (vcnt < 480);
+
+    reg [11:0] framebuffer [0:29][0:31];
+    integer fi, fj;
+    initial begin
+        for (fi=0;fi<30;fi=fi+1)
+            for (fj=0;fj<32;fj=fj+1)
+                framebuffer[fi][fj] = 12'h000;
+    end
+    wire [4:0] cell_col = hcnt / 20;
+    wire [4:0] cell_row = vcnt / 16;
+
+    reg [15:0] program_rom [0:255];
+    initial begin
+        for (fi=0;fi<256;fi=fi+1) program_rom[fi] = 16'b1111000000000000;
+        program_rom[0]  = 16'b1101111100000001;
+program_rom[1]  = 16'b1101000100001111;
+program_rom[2]  = 16'b0110000100011000;
+program_rom[3]  = 16'b1101001000001111;
+program_rom[4]  = 16'b0110001000100100;
+program_rom[5]  = 16'b0100000100010010;
+program_rom[6]  = 16'b1101001100001111;
+program_rom[7]  = 16'b0100000100010011;
+program_rom[8]  = 16'b1101010100000000;
+program_rom[9]  = 16'b1100100000011110;
+program_rom[10] = 16'b1101011100000000;
+program_rom[11] = 16'b1100100000100000;
+program_rom[12] = 16'b1011011101010000;
+program_rom[13] = 16'b1101011101110001;
+program_rom[14] = 16'b1010011110001101;
+program_rom[15] = 16'b1101010101010001;
+program_rom[16] = 16'b1100100000011110;
+program_rom[17] = 16'b1010010110001000;
+program_rom[18] = 16'b1101100100000001;
+program_rom[19] = 16'b1101101000000001;
+program_rom[20] = 16'b1100101100001110;
+program_rom[21] = 16'b1101011000000000;
+
+// COLOR sprite 1: plus shape around (R9, R11)
+program_rom[22] = 16'b1011100110110001; // DRAW R9, R11, R1     center
+program_rom[23] = 16'b1101110110111111; // ADDI R13, R11, -1    up offset
+program_rom[24] = 16'b1011100111010001; // DRAW R9, R13, R1     up pixel
+program_rom[25] = 16'b1101110110110001; // ADDI R13, R11, +1    down offset
+program_rom[26] = 16'b1011100111010001; // DRAW R9, R13, R1     down pixel
+program_rom[27] = 16'b1101110010011111; // ADDI R12, R9,  -1    left offset
+program_rom[28] = 16'b1011110010110001; // DRAW R12, R11, R1    left pixel
+program_rom[29] = 16'b1101110010010001; // ADDI R12, R9,  +1    right offset
+program_rom[30] = 16'b1011110010110001; // DRAW R12, R11, R1    right pixel
+program_rom[31] = 16'b1011100110110001; // DRAW R9, R11, R1     (padding - harmless center redraw)
+program_rom[32] = 16'b1011100110110001;
+program_rom[33] = 16'b1011100110110001;
+program_rom[34] = 16'b1011100110110001;
+program_rom[35] = 16'b1011100110110001;
+program_rom[36] = 16'b1011100110110001;
+program_rom[37] = 16'b1011100110110001;
+program_rom[38] = 16'b1011100110110001;
+
+// control / delay loop - unchanged
+program_rom[39] = 16'b1110111000000000;
+program_rom[40] = 16'b1001111000001110;
+program_rom[41] = 16'b1110111000000000;
+program_rom[42] = 16'b1010000011101110;
+program_rom[43] = 16'b1101011001100001;
+program_rom[44] = 16'b1100111000001010;
+program_rom[45] = 16'b1010011011100011;
+program_rom[46] = 16'b1101011000000000;
+program_rom[47] = 16'b1000000000110001;
+program_rom[48] = 16'b1000000000100111;
+
+// ERASE sprite: same plus shape in black (R0)
+program_rom[49] = 16'b1011100110110000; // DRAW R9, R11, R0     center
+program_rom[50] = 16'b1101110110111111; // ADDI R13, R11, -1    up offset
+program_rom[51] = 16'b1011100111010000; // DRAW R9, R13, R0     up pixel
+program_rom[52] = 16'b1101110110110001; // ADDI R13, R11, +1    down offset
+program_rom[53] = 16'b1011100111010000; // DRAW R9, R13, R0     down pixel
+program_rom[54] = 16'b1101110010011111; // ADDI R12, R9,  -1    left offset
+program_rom[55] = 16'b1011110010110000; // DRAW R12, R11, R0    left pixel
+program_rom[56] = 16'b1101110010010001; // ADDI R12, R9,  +1    right offset
+program_rom[57] = 16'b1011110010110000; // DRAW R12, R11, R0    right pixel
+program_rom[58] = 16'b1011100110110000; // DRAW R9, R11, R0     (padding - harmless center erase)
+program_rom[59] = 16'b1011100110110000;
+program_rom[60] = 16'b1011100110110000;
+program_rom[61] = 16'b1011100110110000;
+program_rom[62] = 16'b1011100110110000;
+program_rom[63] = 16'b1011100110110000;
+program_rom[64] = 16'b1011100110110000;
+program_rom[65] = 16'b1011100110110000;
+
+// movement / bounds logic - unchanged
+program_rom[66] = 16'b1001101000000010;
+program_rom[67] = 16'b0001100110011111;
+program_rom[68] = 16'b1000000001000110;
+program_rom[69] = 16'b0010100110011111;
+program_rom[70] = 16'b1100111000011101;
+program_rom[71] = 16'b1010100111100001;
+program_rom[72] = 16'b1101101000000000;
+program_rom[73] = 16'b1010000010010001;
+program_rom[74] = 16'b1101101000000001;
+
+// COLOR sprite 2: plus shape after move
+program_rom[75] = 16'b1011100110110001; // DRAW R9, R11, R1     center
+program_rom[76] = 16'b1101110110111111; // ADDI R13, R11, -1    up offset
+program_rom[77] = 16'b1011100111010001; // DRAW R9, R13, R1     up pixel
+program_rom[78] = 16'b1101110110110001; // ADDI R13, R11, +1    down offset
+program_rom[79] = 16'b1011100111010001; // DRAW R9, R13, R1     down pixel
+program_rom[80] = 16'b1101110010011111; // ADDI R12, R9,  -1    left offset
+program_rom[81] = 16'b1011110010110001; // DRAW R12, R11, R1    left pixel
+program_rom[82] = 16'b1101110010010001; // ADDI R12, R9,  +1    right offset
+program_rom[83] = 16'b1011110010110001; // DRAW R12, R11, R1    right pixel
+program_rom[84] = 16'b1011100110110001; // DRAW R9, R11, R1     (padding - harmless center redraw)
+program_rom[85] = 16'b1011100110110001;
+program_rom[86] = 16'b1011100110110001;
+program_rom[87] = 16'b1011100110110001;
+program_rom[88] = 16'b1011100110110001;
+program_rom[89] = 16'b1011100110110001;
+program_rom[90] = 16'b1011100110110001;
+program_rom[91] = 16'b1011100110110001;
+
+// loop back - unchanged
+program_rom[92] = 16'b1000000000100111;
+
+    end
+
+    reg [15:0] registers [0:15];
+    reg [7:0] pc;
+    integer ri;
+    initial begin pc=0; for(ri=0;ri<16;ri=ri+1) registers[ri]=0; end
+
+    wire [15:0] instr      = program_rom[pc];
+    wire [3:0]  opcode     = instr[15:12];
+    wire [3:0]  rd         = instr[11:8];
+    wire [3:0]  rs1        = instr[7:4];
+    wire [3:0]  rs2_or_imm = instr[3:0];
+    wire [7:0]  imm8       = instr[7:0];
+    wire [11:0] addr12     = instr[11:0];
+    wire signed [7:0]  br_offs   = {{4{rs2_or_imm[3]}},rs2_or_imm};
+    wire signed [15:0] s_rs1_val = registers[rs1];
+
+    parameter CPU_DIV = 4;
+    reg [19:0] cpu_cnt = 0;
+    wire cpu_tick = (cpu_cnt == CPU_DIV-1);
+    always @(posedge clk) cpu_cnt <= (rst||cpu_tick)?0:cpu_cnt+1;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            pc <= 0;
+            for (ri=0;ri<16;ri=ri+1) registers[ri]<=0;
+        end else if (cpu_tick) begin
+            case (opcode)
+                4'b0000: pc<=pc+1;
+                4'b0001: begin registers[rd]<=registers[rs1]+registers[rs2_or_imm]; pc<=pc+1; end
+                4'b0010: begin registers[rd]<=registers[rs1]-registers[rs2_or_imm]; pc<=pc+1; end
+                4'b0011: begin registers[rd]<=registers[rs1]&registers[rs2_or_imm]; pc<=pc+1; end
+                4'b0100: begin registers[rd]<=registers[rs1]|registers[rs2_or_imm]; pc<=pc+1; end
+                4'b0101: begin registers[rd]<=~registers[rs1]; pc<=pc+1; end
+                4'b0110: begin registers[rd]<=registers[rs1]<<rs2_or_imm; pc<=pc+1; end
+                4'b0111: begin registers[rd]<=registers[rs1]>>rs2_or_imm; pc<=pc+1; end
+                4'b1000: pc<=addr12[7:0];
+                4'b1001: begin
+                    if(registers[rs1]==registers[rs2_or_imm]) pc<=pc+1+br_offs;
+                    else pc<=pc+1;
+                end
+                4'b1010: begin
+                    if(s_rs1_val<$signed(registers[rs2_or_imm])) pc<=pc+1+br_offs;
+                    else pc<=pc+1;
+                end
+                4'b1011: begin
+                    if(registers[rs1][4:0]<30&&registers[rd][4:0]<32)
+                        framebuffer[registers[rs1][4:0]][registers[rd][4:0]]<=registers[rs2_or_imm][11:0];
+                    pc<=pc+1;
+                end
+                4'b1100: begin registers[rd]<={8'h00,imm8}; pc<=pc+1; end
+                4'b1101: begin registers[rd]<=registers[rs1]+{{12{rs2_or_imm[3]}},rs2_or_imm}; pc<=pc+1; end
+                4'b1110: begin registers[rd]<={15'b0,vsync_active}; pc<=pc+1; end
+                4'b1111: pc<=pc;
+                default: pc<=pc+1;
+            endcase
+        end
+    end
+
+    always @(posedge clk) begin
+        if (video_on) {Red,Green,Blue} <= framebuffer[cell_row][cell_col];
+        else {Red,Green,Blue} <= 12'h000;
+    end
+endmodule
