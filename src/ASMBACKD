@@ -1,0 +1,380 @@
+`timescale 1ns / 1ps
+module top (
+    input  wire        clk,
+    output reg         Hsync,
+    output reg         Vsync,
+    output reg  [3:0]  Red,
+    output reg  [3:0]  Green,
+    output reg  [3:0]  Blue
+);
+
+// ── Power-on reset ────────────────────────────────────────────────────────────
+reg [3:0] rst_sr = 4'b1111;
+wire rst = rst_sr[0];
+always @(posedge clk) rst_sr <= {1'b0, rst_sr[3:1]};
+
+// ── 25 MHz pixel tick ─────────────────────────────────────────────────────────
+reg [1:0] clk_div = 0;
+wire pixel_tick = (clk_div == 2'd0);
+always @(posedge clk) clk_div <= clk_div + 1;
+
+// ── VGA counters ──────────────────────────────────────────────────────────────
+reg [9:0] hcnt = 0, vcnt = 0;
+always @(posedge clk) begin
+    if (pixel_tick) begin
+        if (hcnt == 799) begin
+            hcnt <= 0;
+            vcnt <= (vcnt == 524) ? 0 : vcnt + 1;
+        end else
+            hcnt <= hcnt + 1;
+    end
+end
+
+wire vsync_active = (vcnt >= 490) && (vcnt < 492);
+wire video_on     = (hcnt < 640) && (vcnt < 480);
+always @(posedge clk) begin
+    Hsync <= ~((hcnt >= 656) && (hcnt < 752));
+    Vsync <= ~vsync_active;
+end
+
+// ── Tile column decode: 32 cols, 20px each ───────────────────────────────────
+wire [4:0] tile_col =
+    (hcnt < 20)  ? 5'd0  : (hcnt < 40)  ? 5'd1  : (hcnt < 60)  ? 5'd2  :
+    (hcnt < 80)  ? 5'd3  : (hcnt < 100) ? 5'd4  : (hcnt < 120) ? 5'd5  :
+    (hcnt < 140) ? 5'd6  : (hcnt < 160) ? 5'd7  : (hcnt < 180) ? 5'd8  :
+    (hcnt < 200) ? 5'd9  : (hcnt < 220) ? 5'd10 : (hcnt < 240) ? 5'd11 :
+    (hcnt < 260) ? 5'd12 : (hcnt < 280) ? 5'd13 : (hcnt < 300) ? 5'd14 :
+    (hcnt < 320) ? 5'd15 : (hcnt < 340) ? 5'd16 : (hcnt < 360) ? 5'd17 :
+    (hcnt < 380) ? 5'd18 : (hcnt < 400) ? 5'd19 : (hcnt < 420) ? 5'd20 :
+    (hcnt < 440) ? 5'd21 : (hcnt < 460) ? 5'd22 : (hcnt < 480) ? 5'd23 :
+    (hcnt < 500) ? 5'd24 : (hcnt < 520) ? 5'd25 : (hcnt < 540) ? 5'd26 :
+    (hcnt < 560) ? 5'd27 : (hcnt < 580) ? 5'd28 : (hcnt < 600) ? 5'd29 :
+    (hcnt < 620) ? 5'd30 : 5'd31;
+
+// Pixel offset within tile col (0..19)
+wire [9:0] hcnt_in_tile =
+    (hcnt < 20)  ? hcnt         : (hcnt < 40)  ? hcnt - 10'd20  :
+    (hcnt < 60)  ? hcnt - 10'd40  : (hcnt < 80)  ? hcnt - 10'd60  :
+    (hcnt < 100) ? hcnt - 10'd80  : (hcnt < 120) ? hcnt - 10'd100 :
+    (hcnt < 140) ? hcnt - 10'd120 : (hcnt < 160) ? hcnt - 10'd140 :
+    (hcnt < 180) ? hcnt - 10'd160 : (hcnt < 200) ? hcnt - 10'd180 :
+    (hcnt < 220) ? hcnt - 10'd200 : (hcnt < 240) ? hcnt - 10'd220 :
+    (hcnt < 260) ? hcnt - 10'd240 : (hcnt < 280) ? hcnt - 10'd260 :
+    (hcnt < 300) ? hcnt - 10'd280 : (hcnt < 320) ? hcnt - 10'd300 :
+    (hcnt < 340) ? hcnt - 10'd320 : (hcnt < 360) ? hcnt - 10'd340 :
+    (hcnt < 380) ? hcnt - 10'd360 : (hcnt < 400) ? hcnt - 10'd380 :
+    (hcnt < 420) ? hcnt - 10'd400 : (hcnt < 440) ? hcnt - 10'd420 :
+    (hcnt < 460) ? hcnt - 10'd440 : (hcnt < 480) ? hcnt - 10'd460 :
+    (hcnt < 500) ? hcnt - 10'd480 : (hcnt < 520) ? hcnt - 10'd500 :
+    (hcnt < 540) ? hcnt - 10'd520 : (hcnt < 560) ? hcnt - 10'd540 :
+    (hcnt < 580) ? hcnt - 10'd560 : (hcnt < 600) ? hcnt - 10'd580 :
+    (hcnt < 620) ? hcnt - 10'd600 : hcnt - 10'd620;
+
+// Sub-pixel x within tile (0..3), each = 5 screen pixels
+wire [1:0] px_in_tile =
+    (hcnt_in_tile < 10'd5)  ? 2'd0 :
+    (hcnt_in_tile < 10'd10) ? 2'd1 :
+    (hcnt_in_tile < 10'd15) ? 2'd2 : 2'd3;
+
+// ── Tile row decode: 30 rows, 16px each ──────────────────────────────────────
+wire [4:0] tile_row =
+    (vcnt < 16)  ? 5'd0  : (vcnt < 32)  ? 5'd1  : (vcnt < 48)  ? 5'd2  :
+    (vcnt < 64)  ? 5'd3  : (vcnt < 80)  ? 5'd4  : (vcnt < 96)  ? 5'd5  :
+    (vcnt < 112) ? 5'd6  : (vcnt < 128) ? 5'd7  : (vcnt < 144) ? 5'd8  :
+    (vcnt < 160) ? 5'd9  : (vcnt < 176) ? 5'd10 : (vcnt < 192) ? 5'd11 :
+    (vcnt < 208) ? 5'd12 : (vcnt < 224) ? 5'd13 : (vcnt < 240) ? 5'd14 :
+    (vcnt < 256) ? 5'd15 : (vcnt < 272) ? 5'd16 : (vcnt < 288) ? 5'd17 :
+    (vcnt < 304) ? 5'd18 : (vcnt < 320) ? 5'd19 : (vcnt < 336) ? 5'd20 :
+    (vcnt < 352) ? 5'd21 : (vcnt < 368) ? 5'd22 : (vcnt < 384) ? 5'd23 :
+    (vcnt < 400) ? 5'd24 : (vcnt < 416) ? 5'd25 : (vcnt < 432) ? 5'd26 :
+    (vcnt < 448) ? 5'd27 : (vcnt < 464) ? 5'd28 : 5'd29;
+
+// Sub-pixel y within tile (0..3): tile rows = 16px, so vcnt[3:2]
+wire [1:0] py_in_tile = vcnt[3:2];
+
+// ── Register pixel coords to prevent combinatorial glitching ─────────────────
+reg [1:0] px_r, py_r;
+reg [4:0] tcol_r, trow_r;
+always @(posedge clk) begin
+    px_r   <= px_in_tile;
+    py_r   <= py_in_tile;
+    tcol_r <= tile_col;
+    trow_r <= tile_row;
+end
+
+// ── Palette: 16 x 12-bit RGB444 ──────────────────────────────────────────────
+reg [11:0] palette [0:15];
+integer pi;
+initial begin
+    for (pi = 0; pi < 16; pi = pi + 1) palette[pi] = 12'h000;
+    palette[ 0] = 12'h000; // transparent/black
+    palette[ 1] = 12'h58D; // sky blue
+    palette[ 2] = 12'h0B4; // green
+    palette[ 3] = 12'hFFF; // white
+    palette[ 4] = 12'hF22; // red
+    palette[ 5] = 12'hFA0; // orange (sun)
+    palette[ 6] = 12'h333; // dark grey (ground detail)
+    palette[ 7] = 12'hFF0; // yellow
+end
+
+// ── Tile graphics: 32 tiles x 16 pixels (4x4 grid), 4-bit palette index ──────
+// Address = tile_id*16 + py*4 + px
+reg [3:0] tile_gfx [0:511];
+integer gi;
+initial begin
+    for (gi = 0; gi < 512; gi = gi + 1) tile_gfx[gi] = 4'h0;
+
+    // ── Tile 0: Sky (solid sky blue) ─────────────────────────────────────────
+    tile_gfx[  0] = 4'd1; tile_gfx[  1] = 4'd1; tile_gfx[  2] = 4'd1; tile_gfx[  3] = 4'd1;
+    tile_gfx[  4] = 4'd1; tile_gfx[  5] = 4'd1; tile_gfx[  6] = 4'd1; tile_gfx[  7] = 4'd1;
+    tile_gfx[  8] = 4'd1; tile_gfx[  9] = 4'd1; tile_gfx[ 10] = 4'd1; tile_gfx[ 11] = 4'd1;
+    tile_gfx[ 12] = 4'd1; tile_gfx[ 13] = 4'd1; tile_gfx[ 14] = 4'd1; tile_gfx[ 15] = 4'd1;
+
+    // ── Tile 1: Ground (green top, dark grey body) ────────────────────────────
+    tile_gfx[ 16] = 4'd2; tile_gfx[ 17] = 4'd2; tile_gfx[ 18] = 4'd2; tile_gfx[ 19] = 4'd2;
+    tile_gfx[ 20] = 4'd2; tile_gfx[ 21] = 4'd2; tile_gfx[ 22] = 4'd2; tile_gfx[ 23] = 4'd2;
+    tile_gfx[ 24] = 4'd6; tile_gfx[ 25] = 4'd6; tile_gfx[ 26] = 4'd6; tile_gfx[ 27] = 4'd6;
+    tile_gfx[ 28] = 4'd6; tile_gfx[ 29] = 4'd6; tile_gfx[ 30] = 4'd6; tile_gfx[ 31] = 4'd6;
+
+    // ── Tile 2: Sun (orange/yellow circle) ───────────────────────────────────
+    tile_gfx[ 32] = 4'd1; tile_gfx[ 33] = 4'd5; tile_gfx[ 34] = 4'd5; tile_gfx[ 35] = 4'd1;
+    tile_gfx[ 36] = 4'd5; tile_gfx[ 37] = 4'd7; tile_gfx[ 38] = 4'd7; tile_gfx[ 39] = 4'd5;
+    tile_gfx[ 40] = 4'd5; tile_gfx[ 41] = 4'd7; tile_gfx[ 42] = 4'd7; tile_gfx[ 43] = 4'd5;
+    tile_gfx[ 44] = 4'd1; tile_gfx[ 45] = 4'd5; tile_gfx[ 46] = 4'd5; tile_gfx[ 47] = 4'd1;
+
+    // ── Tile 3: Cloud (white puffs on sky) ───────────────────────────────────
+    tile_gfx[ 48] = 4'd1; tile_gfx[ 49] = 4'd3; tile_gfx[ 50] = 4'd3; tile_gfx[ 51] = 4'd1;
+    tile_gfx[ 52] = 4'd3; tile_gfx[ 53] = 4'd3; tile_gfx[ 54] = 4'd3; tile_gfx[ 55] = 4'd3;
+    tile_gfx[ 56] = 4'd3; tile_gfx[ 57] = 4'd3; tile_gfx[ 58] = 4'd3; tile_gfx[ 59] = 4'd3;
+    tile_gfx[ 60] = 4'd1; tile_gfx[ 61] = 4'd1; tile_gfx[ 62] = 4'd1; tile_gfx[ 63] = 4'd1;
+
+    // ── Tile 4: Character sprite (white body, red accents) ───────────────────
+    // row0: _WW_   row1: RWWR   row2: _WW_   row3: _RR_
+    tile_gfx[ 64] = 4'd0; tile_gfx[ 65] = 4'd3; tile_gfx[ 66] = 4'd3; tile_gfx[ 67] = 4'd0;
+    tile_gfx[ 68] = 4'd4; tile_gfx[ 69] = 4'd3; tile_gfx[ 70] = 4'd3; tile_gfx[ 71] = 4'd4;
+    tile_gfx[ 72] = 4'd0; tile_gfx[ 73] = 4'd3; tile_gfx[ 74] = 4'd3; tile_gfx[ 75] = 4'd0;
+    tile_gfx[ 76] = 4'd0; tile_gfx[ 77] = 4'd4; tile_gfx[ 78] = 4'd4; tile_gfx[ 79] = 4'd0;
+end
+
+// ── Tilemap: 30 rows x 32 cols, 5-bit tile ID ────────────────────────────────
+reg [4:0] tilemap [0:959];
+integer ti;
+initial begin
+    for (ti = 0; ti < 960; ti = ti + 1) begin
+        if (ti < 768)       tilemap[ti] = 5'd0; // sky rows 0-23
+        else                tilemap[ti] = 5'd1; // ground rows 24-29
+    end
+    // Sun at tile (2,2)
+    tilemap[2*32 + 2] = 5'd2;
+    // Clouds
+    tilemap[3*32 + 8]  = 5'd3;
+    tilemap[3*32 + 9]  = 5'd3;
+    tilemap[5*32 + 20] = 5'd3;
+    tilemap[5*32 + 21] = 5'd3;
+    tilemap[5*32 + 22] = 5'd3;
+    tilemap[1*32 + 15] = 5'd3;
+    tilemap[1*32 + 16] = 5'd3;
+end
+
+// ── Sprite table: 8 sprites, 16-bit packed ───────────────────────────────────
+// [15:11]=y [10:6]=x [5:1]=tile_id [0]=visible
+reg [15:0] sprite_table [0:7];
+initial begin : sprite_init
+    integer s;
+    for (s = 0; s < 8; s = s + 1) sprite_table[s] = 16'h0000;
+    // Sprite 0: character at y=22, x=4, tile=4, visible
+    // {22, 4, 4, 1} = {5'd22, 5'd4, 5'd4, 1'b1}
+    sprite_table[0] = {5'd22, 5'd4, 5'd4, 1'b1};
+end
+
+// ── Background rendering (registered pipeline) ────────────────────────────────
+wire [9:0]  tm_addr   = ({5'b0, trow_r} << 5) | {5'b0, tcol_r};
+wire [4:0]  bg_tid    = tilemap[tm_addr];
+wire [8:0]  gfx_addr  = {bg_tid, py_r, px_r};
+wire [3:0]  bg_pal    = tile_gfx[gfx_addr];
+wire [11:0] bg_colour = palette[bg_pal];
+
+// ── Sprite overlay ────────────────────────────────────────────────────────────
+reg [11:0] pixel_colour;
+integer sp;
+always @(*) begin
+    pixel_colour = bg_colour;
+    for (sp = 7; sp >= 0; sp = sp - 1) begin
+        if (sprite_table[sp][0] == 1'b1) begin
+            if (sprite_table[sp][10:6] == tcol_r &&
+                sprite_table[sp][15:11] == trow_r) begin : sp_lookup
+                reg [8:0] sp_addr;
+                reg [3:0] sp_pal;
+                sp_addr = {sprite_table[sp][5:1], py_r, px_r};
+                sp_pal  = tile_gfx[sp_addr];
+                if (sp_pal != 4'h0)
+                    pixel_colour = palette[sp_pal];
+            end
+        end
+    end
+end
+
+// ── VGA output ────────────────────────────────────────────────────────────────
+always @(posedge clk) begin
+    if (video_on) {Red, Green, Blue} <= pixel_colour;
+    else          {Red, Green, Blue} <= 12'h000;
+end
+
+// ── Program ROM ───────────────────────────────────────────────────────────────
+reg [15:0] program_rom [0:255];
+integer fi;
+initial begin
+    for (fi = 0; fi < 256; fi = fi + 1)
+        program_rom[fi] = 16'b1111_0000_0000_0000; // HALT
+
+    // ── REGISTER PLAN ────────────────────────────────────────────────────────
+    // R0  = 0 (never written)
+    // R1  = sprite X position (0..31)
+    // R2  = sprite Y position (fixed=22)
+    // R3  = X direction (1=right, 0=left)
+    // R4  = frame counter
+    // R5  = frame gate (move every N frames)
+    // R6  = scratch / boundary temp
+    // R9  = packed sprite word
+    // R11 = scratch
+    // R14 = vsync temp
+
+    // ── INIT (pc=0) ───────────────────────────────────────────────────────────
+    program_rom[  0] = 16'b1100_0001_0000_0100; // SETX R1, 4      X=4
+    program_rom[  1] = 16'b1100_0010_0001_0110; // SETX R2, 22     Y=22
+    program_rom[  2] = 16'b1101_0011_0000_0001; // ADDI R3, R0, 1  dir=right
+    program_rom[  3] = 16'b1101_0100_0000_0000; // ADDI R4, R0, 0  frame_cnt=0
+    program_rom[  4] = 16'b1101_0101_0000_0100; // ADDI R5, R0, 4  frame_gate=4
+
+    // ── WRITE INITIAL SPRITE (pc=5) ───────────────────────────────────────────
+    // Pack: {Y[4:0], X[4:0], tile_id=4[4:0], visible=1}
+    // Build: R9 = Y, shift 5, OR X, shift 5, OR tile_id=4, shift 1, OR 1
+    program_rom[  5] = 16'b0001_1001_0010_0000; // ADD  R9, R2, R0   R9=Y
+    program_rom[  6] = 16'b0110_1001_1001_0101; // LSHIFT R9,R9,5
+    program_rom[  7] = 16'b0100_1001_1001_0001; // OR R9,R9,R1       |= X
+    program_rom[  8] = 16'b0110_1001_1001_0101; // LSHIFT R9,R9,5
+    program_rom[  9] = 16'b1101_1011_0000_0100; // ADDI R11,R0,4     tile_id=4
+    program_rom[ 10] = 16'b0100_1001_1001_1011; // OR R9,R9,R11
+    program_rom[ 11] = 16'b0110_1001_1001_0001; // LSHIFT R9,R9,1
+    program_rom[ 12] = 16'b1101_1011_0000_0001; // ADDI R11,R0,1     visible=1
+    program_rom[ 13] = 16'b0100_1001_1001_1011; // OR R9,R9,R11
+    program_rom[ 14] = 16'b1101_1000_0000_0000; // ADDI R8,R0,0      sprite index=0
+    program_rom[ 15] = 16'b0000_0010_1000_1001; // SSET R8,R9
+
+    // ── GAME LOOP (pc=16) ─────────────────────────────────────────────────────
+    // Wait vsync HIGH
+    program_rom[ 16] = 16'b1110_1110_0000_0000; // LOAD R14
+    program_rom[ 17] = 16'b1001_1110_0000_1110; // BEQ R14,R0,-2  -> pc=16
+    // Wait vsync LOW
+    program_rom[ 18] = 16'b1110_1110_0000_0000; // LOAD R14
+    program_rom[ 19] = 16'b1010_0000_1110_1110; // BLT R0,R14,-2  -> pc=18
+
+    // Frame gate: R4++, if R4 < R5 loop back
+    program_rom[ 20] = 16'b1101_0100_0100_0001; // ADDI R4,R4,1
+    // BLT R4,R5,+1: if R4<5 skip JMP -> JMP 16
+    program_rom[ 21] = 16'b1010_0100_0101_0001; // BLT R4,R5,+1
+    program_rom[ 22] = 16'b1000_0000_0001_0000; // JMP 16
+    program_rom[ 23] = 16'b1101_0100_0000_0000; // ADDI R4,R0,0   reset
+
+    // ── MOVE (pc=24) ──────────────────────────────────────────────────────────
+    // BEQ R3,R0,+2: if dir=left skip to X--
+    program_rom[ 24] = 16'b1001_0011_0000_0010; // BEQ R3,R0,+2
+    program_rom[ 25] = 16'b1101_0001_0001_0001; // ADDI R1,R1,1   X++
+    program_rom[ 26] = 16'b1000_0000_0001_1101; // JMP 29         skip X--
+    program_rom[ 27] = 16'b1101_0001_0001_1111; // ADDI R1,R1,-1  X--
+    program_rom[ 28] = 16'b1000_0000_0001_1101; // JMP 29
+
+    // ── BOUNDARY CHECK (pc=29) ────────────────────────────────────────────────
+    // Right: if X >= 30 turn left
+    program_rom[ 29] = 16'b1100_0110_0001_1110; // SETX R6,30
+    // BLT R1,R6,+1: if X<30 skip
+    program_rom[ 30] = 16'b1010_0001_0110_0001; // BLT R1,R6,+1
+    program_rom[ 31] = 16'b1101_0011_0000_0000; // ADDI R3,R0,0   dir=left
+    // Left: if X <= 1 turn right
+    program_rom[ 32] = 16'b1101_0110_0000_0001; // ADDI R6,R0,1
+    // BLT R6,R1,+1: if 1<X skip
+    program_rom[ 33] = 16'b1010_0110_0001_0001; // BLT R6,R1,+1
+    program_rom[ 34] = 16'b1101_0011_0000_0001; // ADDI R3,R0,1   dir=right
+
+    // ── UPDATE SPRITE (pc=35) ─────────────────────────────────────────────────
+    program_rom[ 35] = 16'b0001_1001_0010_0000; // ADD  R9,R2,R0
+    program_rom[ 36] = 16'b0110_1001_1001_0101; // LSHIFT R9,R9,5
+    program_rom[ 37] = 16'b0100_1001_1001_0001; // OR R9,R9,R1
+    program_rom[ 38] = 16'b0110_1001_1001_0101; // LSHIFT R9,R9,5
+    program_rom[ 39] = 16'b1101_1011_0000_0100; // ADDI R11,R0,4
+    program_rom[ 40] = 16'b0100_1001_1001_1011; // OR R9,R9,R11
+    program_rom[ 41] = 16'b0110_1001_1001_0001; // LSHIFT R9,R9,1
+    program_rom[ 42] = 16'b1101_1011_0000_0001; // ADDI R11,R0,1
+    program_rom[ 43] = 16'b0100_1001_1001_1011; // OR R9,R9,R11
+    program_rom[ 44] = 16'b0000_0010_1000_1001; // SSET R8,R9
+
+    program_rom[ 45] = 16'b1000_0000_0001_0000; // JMP 16
+end
+
+// ── Register file + PC ────────────────────────────────────────────────────────
+reg [15:0] registers [0:15];
+reg [7:0]  pc;
+integer ri;
+initial begin
+    pc = 0;
+    for (ri = 0; ri < 16; ri = ri + 1) registers[ri] = 0;
+end
+
+wire [15:0] instr      = program_rom[pc];
+wire [3:0]  opcode     = instr[15:12];
+wire [3:0]  rd         = instr[11:8];
+wire [3:0]  rs1        = instr[7:4];
+wire [3:0]  rs2_or_imm = instr[3:0];
+wire [7:0]  imm8       = instr[7:0];
+wire [11:0] addr12     = instr[11:0];
+wire signed [7:0]  br_offs   = {{4{rs2_or_imm[3]}}, rs2_or_imm};
+wire signed [15:0] s_rs1_val = registers[rs1];
+
+reg [1:0] cpu_cnt = 0;
+wire cpu_tick = (cpu_cnt == 2'd3);
+always @(posedge clk)
+    cpu_cnt <= (rst || cpu_tick) ? 0 : cpu_cnt + 1;
+
+always @(posedge clk) begin
+    if (rst) begin
+        pc <= 0;
+        for (ri = 0; ri < 16; ri = ri + 1) registers[ri] <= 0;
+    end else if (cpu_tick) begin
+        case (opcode)
+            4'b0000: begin
+                case (rd)
+                    4'b0001: if (registers[rs1] < 16'd960) tilemap[registers[rs1][9:0]]      <= registers[rs2_or_imm][4:0];
+                    4'b0010: if (registers[rs1] < 16'd8)   sprite_table[registers[rs1][2:0]] <= registers[rs2_or_imm];
+                    4'b0011: if (registers[rs1] < 16'd512) tile_gfx[registers[rs1][8:0]]     <= registers[rs2_or_imm][3:0];
+                    4'b0100: if (registers[rs1] < 16'd16)  palette[registers[rs1][3:0]]      <= registers[rs2_or_imm][11:0];
+                    default: ;
+                endcase
+                pc <= pc + 1;
+            end
+            4'b0001: begin registers[rd] <= registers[rs1] +  registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0010: begin registers[rd] <= registers[rs1] -  registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0011: begin registers[rd] <= registers[rs1] &  registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0100: begin registers[rd] <= registers[rs1] |  registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0101: begin registers[rd] <= ~registers[rs1];                          pc <= pc+1; end
+            4'b0110: begin registers[rd] <= registers[rs1] << rs2_or_imm;             pc <= pc+1; end
+            4'b0111: begin registers[rd] <= registers[rs1] >> rs2_or_imm;             pc <= pc+1; end
+            4'b1000: pc <= addr12[7:0];
+            4'b1001: begin
+                if (registers[rs1] == registers[rs2_or_imm]) pc <= pc + 1 + br_offs;
+                else pc <= pc + 1;
+            end
+            4'b1010: begin
+                if (s_rs1_val < $signed(registers[rs2_or_imm])) pc <= pc + 1 + br_offs;
+                else pc <= pc + 1;
+            end
+            4'b1011: pc <= pc + 1;
+            4'b1100: begin registers[rd] <= {8'h00, imm8};                                       pc <= pc+1; end
+            4'b1101: begin registers[rd] <= registers[rs1] + {{12{rs2_or_imm[3]}}, rs2_or_imm}; pc <= pc+1; end
+            4'b1110: begin registers[rd] <= {15'b0, vsync_active};                               pc <= pc+1; end
+            4'b1111: pc <= pc;
+            default: pc <= pc + 1;
+        endcase
+    end
+end
+
+endmodule
