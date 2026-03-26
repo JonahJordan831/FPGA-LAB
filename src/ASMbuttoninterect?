@@ -1,0 +1,328 @@
+`timescale 1ns / 1ps
+module top (
+    input  wire        clk,
+    input  wire        btnU,
+    input  wire        btnD,
+    input  wire        btnL,
+    input  wire        btnR,
+    output reg         Hsync,
+    output reg         Vsync,
+    output reg  [3:0]  Red,
+    output reg  [3:0]  Green,
+    output reg  [3:0]  Blue
+);
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
+reg [3:0] rst_sr = 4'b1111;
+wire rst = rst_sr[0];
+always @(posedge clk) rst_sr <= {1'b0, rst_sr[3:1]};
+
+// ── Button word ───────────────────────────────────────────────────────────────
+wire [15:0] btn_word = {12'b0, btnU, btnD, btnL, btnR};
+
+// ── 25 MHz pixel tick ─────────────────────────────────────────────────────────
+reg [1:0] clk_div = 0;
+always @(posedge clk) clk_div <= clk_div + 1;
+wire pixel_tick = (clk_div == 2'd3);
+
+// ── VGA counters ──────────────────────────────────────────────────────────────
+reg [9:0] hcnt = 0, vcnt = 0;
+always @(posedge clk) begin
+    if (pixel_tick) begin
+        if (hcnt == 799) begin
+            hcnt <= 0;
+            if (vcnt == 524) vcnt <= 0;
+            else             vcnt <= vcnt + 1;
+        end else begin
+            hcnt <= hcnt + 1;
+        end
+    end
+end
+
+reg vsync_active = 0;
+always @(posedge clk)
+    vsync_active <= (vcnt >= 490) && (vcnt < 492);
+
+always @(posedge clk) begin
+    Hsync <= ~((hcnt >= 656) && (hcnt < 752));
+    Vsync <= ~vsync_active;
+end
+wire video_on = (hcnt < 640) && (vcnt < 480);
+
+// ── Tile decode ───────────────────────────────────────────────────────────────
+wire [4:0] tile_col =
+    (hcnt<20)?5'd0:(hcnt<40)?5'd1:(hcnt<60)?5'd2:(hcnt<80)?5'd3:
+    (hcnt<100)?5'd4:(hcnt<120)?5'd5:(hcnt<140)?5'd6:(hcnt<160)?5'd7:
+    (hcnt<180)?5'd8:(hcnt<200)?5'd9:(hcnt<220)?5'd10:(hcnt<240)?5'd11:
+    (hcnt<260)?5'd12:(hcnt<280)?5'd13:(hcnt<300)?5'd14:(hcnt<320)?5'd15:
+    (hcnt<340)?5'd16:(hcnt<360)?5'd17:(hcnt<380)?5'd18:(hcnt<400)?5'd19:
+    (hcnt<420)?5'd20:(hcnt<440)?5'd21:(hcnt<460)?5'd22:(hcnt<480)?5'd23:
+    (hcnt<500)?5'd24:(hcnt<520)?5'd25:(hcnt<540)?5'd26:(hcnt<560)?5'd27:
+    (hcnt<580)?5'd28:(hcnt<600)?5'd29:(hcnt<620)?5'd30:5'd31;
+
+wire [4:0] tile_row =
+    (vcnt<16)?5'd0:(vcnt<32)?5'd1:(vcnt<48)?5'd2:(vcnt<64)?5'd3:
+    (vcnt<80)?5'd4:(vcnt<96)?5'd5:(vcnt<112)?5'd6:(vcnt<128)?5'd7:
+    (vcnt<144)?5'd8:(vcnt<160)?5'd9:(vcnt<176)?5'd10:(vcnt<192)?5'd11:
+    (vcnt<208)?5'd12:(vcnt<224)?5'd13:(vcnt<240)?5'd14:(vcnt<256)?5'd15:
+    (vcnt<272)?5'd16:(vcnt<288)?5'd17:(vcnt<304)?5'd18:(vcnt<320)?5'd19:
+    (vcnt<336)?5'd20:(vcnt<352)?5'd21:(vcnt<368)?5'd22:(vcnt<384)?5'd23:
+    (vcnt<400)?5'd24:(vcnt<416)?5'd25:(vcnt<432)?5'd26:(vcnt<448)?5'd27:
+    (vcnt<464)?5'd28:5'd29;
+
+// ── 2D framebuffer ────────────────────────────────────────────────────────────
+reg [11:0] framebuffer [0:29][0:31];
+integer fi, fj;
+initial begin
+    for (fi=0; fi<30; fi=fi+1)
+        for (fj=0; fj<32; fj=fj+1)
+            framebuffer[fi][fj] = 12'h000;
+end
+
+// ── Program ROM ───────────────────────────────────────────────────────────────
+reg [15:0] program_rom [0:255];
+initial begin
+    for (fi=0; fi<256; fi=fi+1)
+        program_rom[fi] = 16'b1111000000000000;
+
+    // BUILD COLOURS
+    program_rom[ 0] = 16'b1101111100000001;
+    program_rom[ 1] = 16'b1101000100001111;
+    program_rom[ 2] = 16'b0110000100011000;
+    program_rom[ 3] = 16'b1101001000001111;
+    program_rom[ 4] = 16'b0110001000100100;
+    program_rom[ 5] = 16'b0100000100010010;
+    program_rom[ 6] = 16'b1101001100001111;
+    program_rom[ 7] = 16'b0100000100010011;
+
+    program_rom[ 8] = 16'b1100001001011000;
+    program_rom[ 9] = 16'b0110001000100100;
+    program_rom[10] = 16'b1101001000101101;
+
+    program_rom[11] = 16'b1100001100101101;
+    program_rom[12] = 16'b0110001100110100;
+    program_rom[13] = 16'b1101001100110110;
+
+    program_rom[14] = 16'b1100010000001011;
+    program_rom[15] = 16'b0110010001000100;
+    program_rom[16] = 16'b1101010001000100;
+
+    // Centre position: col=15 (R5), row=11 (R6)
+    program_rom[17] = 16'hC50F; // SETX R5, 15
+    program_rom[18] = 16'hC60B; // SETX R6, 11
+    program_rom[19] = 16'b1101100100000001; // R9 = 1
+
+    // PAINT SKY rows 0-22
+    program_rom[20] = 16'b1101110100000000;
+    program_rom[21] = 16'b1101101100000000;
+    program_rom[22] = 16'b1011101111010010;
+    program_rom[23] = 16'b1101101110110001;
+    program_rom[24] = 16'b1100111100100000;
+    program_rom[25] = 16'b1001101111110001;
+    program_rom[26] = 16'b1000000000010110;
+    program_rom[27] = 16'b1101110111010001;
+    program_rom[28] = 16'b1100111100011110;
+    program_rom[29] = 16'b1001110111110001;
+    program_rom[30] = 16'b1000000000010101;
+
+    // PAINT GRASS row 23
+    program_rom[31] = 16'b1100110100010111;
+    program_rom[32] = 16'b1101101100000000;
+    program_rom[33] = 16'b1100111100100000;
+    program_rom[34] = 16'b1011101111010011;
+    program_rom[35] = 16'b1101101110110001;
+    program_rom[36] = 16'b1001101111110001;
+    program_rom[37] = 16'b1000000000100010;
+
+    // PAINT GROUND rows 24-29
+    program_rom[38] = 16'b1100110100011000;
+    program_rom[39] = 16'b1101101100000000;
+    program_rom[40] = 16'b1100111100100000;
+    program_rom[41] = 16'b1011101111010100;
+    program_rom[42] = 16'b1101101110110001;
+    program_rom[43] = 16'b1001101111110001;
+    program_rom[44] = 16'b1000000000101001;
+    program_rom[45] = 16'b1101110111010001;
+    program_rom[46] = 16'b1100111100011110;
+    program_rom[47] = 16'b1001110111110001;
+    program_rom[48] = 16'b1000000000100111;
+
+    // SUN 0xFA0
+    program_rom[49] = 16'b1100111111111010;
+    program_rom[50] = 16'b0110111111110100;
+    program_rom[51] = 16'b1101110000000001;
+    program_rom[52] = 16'b1101101100000001;
+    program_rom[53] = 16'b1011101111001111;
+    program_rom[54] = 16'b1101101100000010;
+    program_rom[55] = 16'b1011101111001111;
+    program_rom[56] = 16'b1101110000000010;
+    program_rom[57] = 16'b1101101100000001;
+    program_rom[58] = 16'b1011101111001111;
+    program_rom[59] = 16'b1101101100000010;
+    program_rom[60] = 16'b1011101111001111;
+
+    // DRAW INITIAL CROSS at (col=R5, row=R6) — pc=61
+    // STORE fb[rd=row][rs1=col] = rs2
+    program_rom[61] = 16'b1011011001010001; // fb[R6][R5]  = white (centre)
+    program_rom[62] = 16'b1101110001101111; // R14 = R6-1
+    program_rom[63] = 16'b1011011101010001; // fb[R14][R5] = white (up)
+    program_rom[64] = 16'b1101110001100001; // R14 = R6+1
+    program_rom[65] = 16'b1011011101010001; // fb[R14][R5] = white (down)
+    program_rom[66] = 16'b1101101101011111; // R13 = R5-1
+    program_rom[67] = 16'b1011011001101001; // fb[R6][R13] = white (left)
+    program_rom[68] = 16'b1101101101010001; // R13 = R5+1
+    program_rom[69] = 16'b1011011001101001; // fb[R6][R13] = white (right)
+
+    // VSYNC WAIT — pc=70
+    program_rom[70] = 16'b1110111000000000; // R14 = vsync_flag
+    program_rom[71] = 16'b1001111000001110; // BEQ R14,R0 -> -2 (loop)
+
+    // ERASE CROSS — pc=72
+    program_rom[72] = 16'b1011011001010010; // fb[R6][R5]  = sky (centre)
+    program_rom[73] = 16'b1101110001101111; // R14 = R6-1
+    program_rom[74] = 16'b1011011101010010; // fb[R14][R5] = sky (up)
+    program_rom[75] = 16'b1101110001100001; // R14 = R6+1
+    program_rom[76] = 16'b1011011101010010; // fb[R14][R5] = sky (down)
+    program_rom[77] = 16'b1101101101011111; // R13 = R5-1
+    program_rom[78] = 16'b1011011001101010; // fb[R6][R13] = sky (left)
+    program_rom[79] = 16'b1101101101010001; // R13 = R5+1
+    program_rom[80] = 16'b1011011001101010; // fb[R6][R13] = sky (right)
+
+    // READ BUTTONS — pc=81
+    program_rom[81] = 16'b0000011100000000; // R7 = buttons
+
+    // RIGHT bit0
+    program_rom[82] = 16'b0011100001111001; // R8 = R7 & R9
+    program_rom[83] = 16'b1001100000000001; // BEQ R8,R0 skip
+    program_rom[84] = 16'b1101010101010001; // R5 = R5+1
+
+    // LEFT bit1
+    program_rom[85] = 16'b1101111100000010; // R15 = 2
+    program_rom[86] = 16'b0011100001111111; // R8 = R7 & R15
+    program_rom[87] = 16'b1001100000000001; // BEQ R8,R0 skip
+    program_rom[88] = 16'b1101010101011111; // R5 = R5-1
+
+    // DOWN bit2
+    program_rom[89] = 16'b1101111100000100; // R15 = 4
+    program_rom[90] = 16'b0011100001111111; // R8 = R7 & R15
+    program_rom[91] = 16'b1001100000000001; // BEQ R8,R0 skip
+    program_rom[92] = 16'b1101011001100001; // R6 = R6+1
+
+    // UP bit3
+    program_rom[93] = 16'b1101111100001000; // R15 = 8
+    program_rom[94] = 16'b0011100001111111; // R8 = R7 & R15
+    program_rom[95] = 16'b1001100000000001; // BEQ R8,R0 skip
+    program_rom[96] = 16'b1101011001101111; // R6 = R6-1
+
+    // CLAMP X 1..30 — pc=97
+    program_rom[97] = 16'b1001010100000001; // BEQ R5,R0 -> +1
+    program_rom[98] = 16'b1000000001100011; // JMP 99
+    program_rom[99] = 16'b1100010100000001; // R5 = 1
+    program_rom[100]= 16'b1100111100011111; // R15 = 31
+    program_rom[101]= 16'b1001010111110001; // BEQ R5,R15 -> +1
+    program_rom[102]= 16'b1000000001100111; // JMP 103
+    program_rom[103]= 16'b1100010100011110; // R5 = 30
+
+    // CLAMP Y 1..21 — pc=104
+    program_rom[104]= 16'b1001011000000001; // BEQ R6,R0 -> +1
+    program_rom[105]= 16'b1000000001101010; // JMP 106
+    program_rom[106]= 16'b1100011000000001; // R6 = 1
+    program_rom[107]= 16'b1100111100010110; // R15 = 22
+    program_rom[108]= 16'b1001011011110001; // BEQ R6,R15 -> +1
+    program_rom[109]= 16'b1000000001101110; // JMP 110
+    program_rom[110]= 16'b1100011000010101; // R6 = 21
+
+    // DRAW CROSS — pc=111
+    program_rom[111]= 16'b1011011001010001; // fb[R6][R5]  = white (centre)
+    program_rom[112]= 16'b1101110001101111; // R14 = R6-1
+    program_rom[113]= 16'b1011011101010001; // fb[R14][R5] = white (up)
+    program_rom[114]= 16'b1101110001100001; // R14 = R6+1
+    program_rom[115]= 16'b1011011101010001; // fb[R14][R5] = white (down)
+    program_rom[116]= 16'b1101101101011111; // R13 = R5-1
+    program_rom[117]= 16'b1011011001101001; // fb[R6][R13] = white (left)
+    program_rom[118]= 16'b1101101101010001; // R13 = R5+1
+    program_rom[119]= 16'b1011011001101001; // fb[R6][R13] = white (right)
+
+    program_rom[120]= 16'b1000000001000110; // JMP 70
+end
+
+// ── Register file + PC ────────────────────────────────────────────────────────
+reg [15:0] registers [0:15];
+reg [7:0]  pc;
+integer ri;
+initial begin pc=0; for(ri=0;ri<16;ri=ri+1) registers[ri]=0; end
+
+wire [15:0] instr      = program_rom[pc];
+wire [3:0]  opcode     = instr[15:12];
+wire [3:0]  rd         = instr[11:8];
+wire [3:0]  rs1        = instr[7:4];
+wire [3:0]  rs2_or_imm = instr[3:0];
+wire [7:0]  imm8       = instr[7:0];
+wire [11:0] addr12     = instr[11:0];
+wire signed [7:0]  br_offs   = {{4{rs2_or_imm[3]}},rs2_or_imm};
+wire signed [15:0] s_rs1_val = registers[rs1];
+
+parameter CPU_DIV = 4;
+reg [19:0] cpu_cnt = 0;
+wire cpu_tick = (cpu_cnt == CPU_DIV-1);
+always @(posedge clk)
+    cpu_cnt <= (rst || cpu_tick) ? 0 : cpu_cnt + 1;
+
+// ── Vsync flag — single always block, one driver ──────────────────────────────
+(* KEEP = "TRUE" *) reg vsync_prev = 0;
+(* KEEP = "TRUE" *) reg vsync_flag = 0;
+always @(posedge clk) begin
+    vsync_prev <= vsync_active;
+    if (vsync_active && !vsync_prev)
+        vsync_flag <= 1;                          // set on rising edge of vsync
+    else if (cpu_tick && opcode == 4'b1110)
+        vsync_flag <= 0;                          // clear when CPU reads it
+end
+
+// ── Execute ───────────────────────────────────────────────────────────────────
+always @(posedge clk) begin
+    if (rst) begin
+        pc <= 0;
+        for (ri=0;ri<16;ri=ri+1) registers[ri] <= 0;
+    end else if (cpu_tick) begin
+        case (opcode)
+            4'b0000: begin registers[rd] <= btn_word;                              pc <= pc+1; end
+            4'b0001: begin registers[rd] <= registers[rs1]+registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0010: begin registers[rd] <= registers[rs1]-registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0011: begin registers[rd] <= registers[rs1]&registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0100: begin registers[rd] <= registers[rs1]|registers[rs2_or_imm]; pc <= pc+1; end
+            4'b0101: begin registers[rd] <= ~registers[rs1];                       pc <= pc+1; end
+            4'b0110: begin registers[rd] <= registers[rs1]<<rs2_or_imm;            pc <= pc+1; end
+            4'b0111: begin registers[rd] <= registers[rs1]>>rs2_or_imm;            pc <= pc+1; end
+            4'b1000: pc <= addr12[7:0];
+            4'b1001: begin
+                if (registers[rd] == registers[rs1]) pc <= pc+1+br_offs;
+                else pc <= pc+1;
+            end
+            4'b1010: begin
+                if (s_rs1_val < $signed(registers[rs2_or_imm])) pc <= pc+1+br_offs;
+                else pc <= pc+1;
+            end
+            // STORE: framebuffer[rd=row][rs1=col] = rs2 colour
+            4'b1011: begin
+                if (registers[rd][4:0] < 30 && registers[rs1][4:0] < 32)
+                    framebuffer[registers[rd][4:0]][registers[rs1][4:0]] <= registers[rs2_or_imm][11:0];
+                pc <= pc+1;
+            end
+            4'b1100: begin registers[rd] <= {8'h00, imm8};                                    pc <= pc+1; end
+            4'b1101: begin registers[rd] <= registers[rs1]+{{12{rs2_or_imm[3]}},rs2_or_imm};  pc <= pc+1; end
+            // READ vsync — flag cleared by vsync always block above
+            4'b1110: begin registers[rd] <= {15'b0, vsync_flag};                              pc <= pc+1; end
+            4'b1111: pc <= pc;
+            default: pc <= pc+1;
+        endcase
+    end
+end
+
+// ── VGA output ────────────────────────────────────────────────────────────────
+always @(posedge clk) begin
+    if (video_on) {Red,Green,Blue} <= framebuffer[tile_row][tile_col];
+    else          {Red,Green,Blue} <= 12'h000;
+end
+
+endmodule
