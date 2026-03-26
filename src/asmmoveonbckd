@@ -1,0 +1,429 @@
+`timescale 1ns / 1ps
+module top (
+    input  wire        clk,
+    output reg         Hsync,
+    output reg         Vsync,
+    output reg  [3:0]  Red,
+    output reg  [3:0]  Green,
+    output reg  [3:0]  Blue
+);
+
+reg [3:0] rst_sr = 4'b1111;
+wire rst = rst_sr[0];
+always @(posedge clk) rst_sr <= {1'b0, rst_sr[3:1]};
+
+reg [1:0] clk_div = 0;
+wire pixel_tick = (clk_div == 2'd0);
+always @(posedge clk) clk_div <= clk_div + 1;
+
+reg [9:0] hcnt = 0, vcnt = 0;
+always @(posedge clk) begin
+    if (pixel_tick) begin
+        if (hcnt == 799) begin hcnt <= 0; vcnt <= (vcnt==524)?0:vcnt+1; end
+        else hcnt <= hcnt + 1;
+    end
+end
+wire vsync_active = (vcnt >= 490) && (vcnt < 492);
+always @(posedge clk) begin
+    Hsync <= ~((hcnt>=656)&&(hcnt<752));
+    Vsync <= ~vsync_active;
+end
+wire video_on = (hcnt < 640) && (vcnt < 480);
+
+wire [4:0] tile_col =
+    (hcnt<20)?5'd0:(hcnt<40)?5'd1:(hcnt<60)?5'd2:(hcnt<80)?5'd3:
+    (hcnt<100)?5'd4:(hcnt<120)?5'd5:(hcnt<140)?5'd6:(hcnt<160)?5'd7:
+    (hcnt<180)?5'd8:(hcnt<200)?5'd9:(hcnt<220)?5'd10:(hcnt<240)?5'd11:
+    (hcnt<260)?5'd12:(hcnt<280)?5'd13:(hcnt<300)?5'd14:(hcnt<320)?5'd15:
+    (hcnt<340)?5'd16:(hcnt<360)?5'd17:(hcnt<380)?5'd18:(hcnt<400)?5'd19:
+    (hcnt<420)?5'd20:(hcnt<440)?5'd21:(hcnt<460)?5'd22:(hcnt<480)?5'd23:
+    (hcnt<500)?5'd24:(hcnt<520)?5'd25:(hcnt<540)?5'd26:(hcnt<560)?5'd27:
+    (hcnt<580)?5'd28:(hcnt<600)?5'd29:(hcnt<620)?5'd30:5'd31;
+
+wire [4:0] tile_row =
+    (vcnt<16)?5'd0:(vcnt<32)?5'd1:(vcnt<48)?5'd2:(vcnt<64)?5'd3:
+    (vcnt<80)?5'd4:(vcnt<96)?5'd5:(vcnt<112)?5'd6:(vcnt<128)?5'd7:
+    (vcnt<144)?5'd8:(vcnt<160)?5'd9:(vcnt<176)?5'd10:(vcnt<192)?5'd11:
+    (vcnt<208)?5'd12:(vcnt<224)?5'd13:(vcnt<240)?5'd14:(vcnt<256)?5'd15:
+    (vcnt<272)?5'd16:(vcnt<288)?5'd17:(vcnt<304)?5'd18:(vcnt<320)?5'd19:
+    (vcnt<336)?5'd20:(vcnt<352)?5'd21:(vcnt<368)?5'd22:(vcnt<384)?5'd23:
+    (vcnt<400)?5'd24:(vcnt<416)?5'd25:(vcnt<432)?5'd26:(vcnt<448)?5'd27:
+    (vcnt<464)?5'd28:5'd29;
+
+// 2D framebuffer identical to working cross
+reg [11:0] framebuffer [0:29][0:31];
+integer fi, fj;
+initial begin
+    for (fi=0; fi<30; fi=fi+1)
+        for (fj=0; fj<32; fj=fj+1)
+            framebuffer[fi][fj] = 12'h000;
+end
+
+// ── Program ROM ───────────────────────────────────────────────────────────────
+// INSTRUCTION ENCODING (verified from working cross):
+//   ADDI  rd,rs1,imm4 : 1101_rd_rs1_imm4  regs[rd]=regs[rs1]+sext(imm4)
+//   SETX  rd,imm8     : 1100_rd_imm8       regs[rd]=imm8
+//   LSHIFT rd,rs1,imm4: 0110_rd_rs1_imm4
+//   OR    rd,rs1,rs2  : 0100_rd_rs1_rs2
+//   ADD   rd,rs1,rs2  : 0001_rd_rs1_rs2
+//   SUB   rd,rs1,rs2  : 0010_rd_rs1_rs2
+//   DRAW  col,row,clr : 1011_col_row_clr   framebuffer[row][col]=regs[clr]
+//   LOAD  rd          : 1110_rd_0000_0000  regs[rd]=vsync_active
+//   BEQ   rd,rs1,imm4 : 1001_rd_rs1_imm4  if regs[rd]==regs[rs1]: pc+=1+sext(imm4)
+//   BLT   rd,rs1,imm4 : 1010_rd_rs1_imm4  if regs[rs1]<regs[imm4_as_idx]: pc+=1+sext(imm4)
+//                       WARNING: rs2_or_imm used as both reg index AND offset
+//   JMP   addr        : 1000_addr12        pc=addr12[7:0]
+//   HALT              : 1111_xxxxxxxxxxxx
+//
+// REGISTER PLAN:
+//   R0  = 0 (never written)
+//   R1  = white 0xFFF
+//   R2  = sky   0x58D
+//   R3  = grass 0x2D6
+//   R4  = ground 0x0B4
+//   R5  = sprite X (col)
+//   R6  = sprite Y (row) fixed=14
+//   R7  = direction: 1=right 0=left
+//   R8  = frame counter
+//   R9  = frame gate limit (8)
+//   R10 = erase colour
+//   R11 = scratch col offset
+//   R12 = scratch row offset
+//   R14 = vsync temp
+//
+// PC MAP:
+//   0-20  INIT colours + paint background
+//   21-55 Paint background loop (sky rows 0-22, grass row 23, ground rows 24-29)
+//   56-64 Draw initial plus
+//   65-68 VSYNC WAIT
+//   69-71 FRAME GATE (BEQ cnt==limit skip JMP, else JMP vsync)
+//   72-80 ERASE plus
+//   81-86 MOVE + bounds
+//   87-95 DRAW plus new pos
+//   96    JMP 65
+
+reg [15:0] program_rom [0:255];
+initial begin
+    for (fi=0; fi<256; fi=fi+1)
+        program_rom[fi] = 16'b1111000000000000;
+
+    // ── BUILD COLOURS ─────────────────────────────────────────────────────────
+    // R1 = 0xFFF  : R1=0xF, lshift 8 -> 0xF00, OR R2(0xF0), OR R3(0xF)
+    // Exact same encoding as working cross pc0-7
+    program_rom[ 0] = 16'b1101111100000001; // ADDI R15,R0,1   R15=1 (scratch=1)
+    program_rom[ 1] = 16'b1101000100001111; // ADDI R1,R0,15   R1=0xF
+    program_rom[ 2] = 16'b0110000100011000; // LSHIFT R1,R1,8  R1=0xF00
+    program_rom[ 3] = 16'b1101001000001111; // ADDI R2,R0,15   R2=0xF
+    program_rom[ 4] = 16'b0110001000100100; // LSHIFT R2,R2,4  R2=0xF0
+    program_rom[ 5] = 16'b0100000100010010; // OR R1,R1,R2     R1=0xFF0
+    program_rom[ 6] = 16'b1101001100001111; // ADDI R3,R0,15   R3=0xF
+    program_rom[ 7] = 16'b0100000100010011; // OR R1,R1,R3     R1=0xFFF white
+
+    // R2 = 0x58D sky:  R2=0x58, lshift 4 -> 0x580, ADDI 13 -> 0x58D
+    program_rom[ 8] = 16'b1100001001011000; // SETX R2,0x58
+    program_rom[ 9] = 16'b0110001000100100; // LSHIFT R2,R2,4   R2=0x580
+    program_rom[10] = 16'b1101001000101101; // ADDI R2,R2,13    R2=0x58D
+
+    // R3 = 0x2D6 grass: R3=0x2D, lshift 4 -> 0x2D0, ADDI 6 -> 0x2D6
+    program_rom[11] = 16'b1100001100101101; // SETX R3,0x2D
+    program_rom[12] = 16'b0110001100110100; // LSHIFT R3,R3,4   R3=0x2D0
+    program_rom[13] = 16'b1101001100110110; // ADDI R3,R3,6     R3=0x2D6
+
+    // R4 = 0x0B4 ground: R4=0x0B, lshift 4 -> 0xB0, ADDI 4 -> 0x0B4
+    program_rom[14] = 16'b1100010000001011; // SETX R4,0x0B
+    program_rom[15] = 16'b0110010001000100; // LSHIFT R4,R4,4   R4=0x0B0
+    program_rom[16] = 16'b1101010001000100; // ADDI R4,R4,4     R4=0x0B4
+
+    // ── SPRITE + FRAME STATE ──────────────────────────────────────────────────
+    // R5=4(X), R6=14(Y), R7=1(dir right), R8=0(cnt), R9=8(gate)
+    program_rom[17] = 16'b1100010100000100; // SETX R5,4    sprite X
+    program_rom[18] = 16'b1100011000001110; // SETX R6,14   sprite Y
+    program_rom[19] = 16'b1101011100000001; // ADDI R7,R0,1 dir=right
+    program_rom[20] = 16'b1101100000000000; // ADDI R8,R0,0 frame_cnt=0
+    program_rom[21] = 16'b1100100100001000; // SETX R9,8    gate=8
+
+    // ── PAINT BACKGROUND ─────────────────────────────────────────────────────
+    // Loop: R11=col(0..31), R12=row(0..29), paint with correct colour
+    // Use R13 as row counter, R11 as col counter
+    // Paint sky (R2) rows 0-22, grass (R3) row 23, ground (R4) rows 24-29
+    //
+    // Outer loop: R13=row 0..29
+    // Inner loop: R11=col 0..31, DRAW col=R11,row=R13,colour
+    // Colour selection via row value
+
+    program_rom[22] = 16'b1101110100000000; // ADDI R13,R0,0   row=0
+    // row_loop (pc=23):
+    program_rom[23] = 16'b1101101100000000; // ADDI R11,R0,0   col=0
+    // Pick colour: default sky
+    program_rom[24] = 16'b0001101001000000; // ADD R10,R4,R0   default=ground (we'll override)
+    // Actually build colour selection:
+    // if R13<23: R10=sky(R2) elif R13<24: R10=grass(R3) else R10=ground(R4)
+    program_rom[24] = 16'b0001101000100000; // ADD R10,R2,R0   R10=sky default
+    // SETX R15,23
+    program_rom[25] = 16'b1100111100010111; // SETX R15,23
+    // BEQ R13,R15,+1: if row==23 skip to grass  (BEQ rd=R13,rs1=R15,imm=1)
+    program_rom[26] = 16'b1001110111110001; // BEQ R13,R15,+1
+    program_rom[27] = 16'b1000000000100011; // JMP 35          ->col_loop
+    program_rom[28] = 16'b0001101000110000; // ADD R10,R3,R0   R10=grass
+    program_rom[29] = 16'b1000000000100011; // JMP 35          ->col_loop
+    // For ground rows: need BLT. SETX R15,23, BLT R13,R15 -> sky, else check 23
+    // Simpler: restructure as:
+    // pc24: R10=sky
+    // pc25: SETX R15,23; if R13<23(BLT R15,R13 i.e. 23<R13? no...)
+    // Use BEQ for exact row 23, use another check for >=24
+
+    // Actually the above is getting complicated. Let's use a simpler approach:
+    // Just paint all rows as sky first, then overwrite row 23 with grass,
+    // then overwrite rows 24-29 with ground. Three separate loops.
+
+    // RESTART BACKGROUND PAINT with 3 loops:
+    // Loop 1: all sky (rows 0-29 cols 0-31)
+    // Loop 2: grass row 23 (cols 0-31)  
+    // Loop 3: ground rows 24-29 (cols 0-31)
+
+    // Reset pc22 onwards:
+    // Loop 1: sky all framebuffer
+    program_rom[22] = 16'b1101110100000000; // ADDI R13,R0,0   row=0
+    // L1_outer (pc=23):
+    program_rom[23] = 16'b1101101100000000; // ADDI R11,R0,0   col=0
+    // L1_inner (pc=24): DRAW col=R11, row=R13, sky=R2
+    program_rom[24] = 16'b1011101111010010; // DRAW col=R11,row=R13,clr=R2
+    program_rom[25] = 16'b1101101110110001; // ADDI R11,R11,1
+    // BEQ R11,R15,+1: need R15=32
+    program_rom[26] = 16'b1100111100100000; // SETX R15,32
+    // BLT R11,R15,-3: rs1=R15,rs2_or_imm=1101=-3 -> BUT registers[13] is R13
+    // R15=32, R13=row. 32 < R13? Only if row>32, never. So BLT never taken.
+    // We need: if R11<32 jump back to L1_inner
+    // BLT encoding: if registers[rs1] < registers[rs2_or_imm]: branch
+    // We want: if R11 < R15(=32): branch. So rs1=R15, but we want left=R11...
+    // Actually: s_rs1_val=registers[instr[7:4]], compared to registers[instr[3:0]]
+    // So: if registers[rs1] < registers[rs2_or_imm]
+    // For R11<32: rs1 field = R11 index = 11 = 0b1011
+    //             rs2_or_imm = R15 index = 15 = 0b1111 AND offset = -1 = 0b1111
+    // So rs2_or_imm=1111: register[15]=32, offset=sext(1111)=-1
+    // if R11 < R15(32): pc += 1+(-1) = pc (stay) — that loops back 1! 
+    // pc=27: BLT R11,R15,-1: if R11<32: pc=27+1-1=27. Infinite loop!
+    // Need: if R11<32: jump to pc=24 (L1_inner). That's -4 from pc=27.
+    // offset=-4=1100, rs2_or_imm=1100: registers[12]=R12=scratch
+    // if R11 < R12: jump -4. But R12=0 initially. R11<0 never true.
+    // 
+    // This encoding is really constrained. Let me use BEQ instead:
+    // After col loop: BEQ R11,R15(32),+1 skip JMP_back, JMP col_start
+    // BEQ R11,R15,+1: rd=R11,rs1=R15,imm=1
+    // if R11==32: skip JMP -> go to row++
+    // else: JMP back to col start
+    // BEQ: opcode=1001, rd=1011(R11), rs1=1111(R15), rs2_or_imm=0001(+1)
+    program_rom[27] = 16'b1001101111110001; // BEQ R11,R15,+1  if col==32 skip
+    program_rom[28] = 16'b1000000000011000; // JMP 24          col loop
+    // Row increment:
+    program_rom[29] = 16'b1101110111010001; // ADDI R13,R13,1  row++
+    // BEQ R13,R15_30,+1: need R15=30
+    program_rom[30] = 16'b1100111100011110; // SETX R15,30
+    program_rom[31] = 16'b1001110111110001; // BEQ R13,R15,+1  if row==30 skip
+    program_rom[32] = 16'b1000000000010111; // JMP 23          row loop
+    // Done sky fill. Now grass row 23:
+    program_rom[33] = 16'b1100110100010111; // SETX R13,23     row=23
+    program_rom[34] = 16'b1101101100000000; // ADDI R11,R0,0   col=0
+    program_rom[35] = 16'b1100111100100000; // SETX R15,32
+    // L2_inner (pc=36):
+    program_rom[36] = 16'b1011101111010011; // DRAW col=R11,row=R13,clr=R3 (grass)
+    program_rom[37] = 16'b1101101110110001; // ADDI R11,R11,1
+    program_rom[38] = 16'b1001101111110001; // BEQ R11,R15,+1
+    program_rom[39] = 16'b1000000000100100; // JMP 36
+    // Ground rows 24-29:
+    program_rom[40] = 16'b1100110100011000; // SETX R13,24     row=24
+    program_rom[41] = 16'b1100111100100000; // SETX R15,32
+    // L3_outer (pc=42):
+    program_rom[42] = 16'b1101101100000000; // ADDI R11,R0,0   col=0
+    // L3_inner (pc=43):
+    program_rom[43] = 16'b1011101111010100; // DRAW col=R11,row=R13,clr=R4 (ground)
+    program_rom[44] = 16'b1101101110110001; // ADDI R11,R11,1
+    program_rom[45] = 16'b1001101111110001; // BEQ R11,R15,+1
+    program_rom[46] = 16'b1000000000101011; // JMP 43
+    program_rom[47] = 16'b1101110111010001; // ADDI R13,R13,1  row++
+    program_rom[48] = 16'b1100111100011110; // SETX R15,30
+    program_rom[49] = 16'b1001110111110001; // BEQ R13,R15,+1  if row==30 skip
+    program_rom[50] = 16'b1000000000101010; // JMP 42
+    // Background done. Add sun pixels:
+    program_rom[51] = 16'b1100111100001011; // SETX R15,0x0B
+    program_rom[52] = 16'b0110111111110100; // LSHIFT R15,R15,4 0xB0
+    program_rom[53] = 16'b1100101100001011; // SETX R11,0x0B -- scratch, reuse
+    // Build sun colour 0xFF0 in R15: easier just use R1=0xFFF with green
+    // Sun = 0xFA0: R15=0xFA, lshift 4, OR 0
+    program_rom[51] = 16'b1100111111111010; // SETX R15,0xFA
+    program_rom[52] = 16'b0110111111110100; // LSHIFT R15,R15,4  R15=0xFA0
+    // Draw sun: row=1,col=1 and row=1,col=2 and row=2,col=1 and row=2,col=2
+    // DRAW col=1,row=1,clr=R15: need col and row as registers
+    // R11=scratch col, R12=scratch row
+    program_rom[53] = 16'b1101101100000001; // ADDI R11,R0,1   col=1
+    program_rom[54] = 16'b1101110000000001; // ADDI R12,R0,1   row=1
+    program_rom[55] = 16'b1011101111001111; // DRAW col=R11,row=R12,clr=R15
+    program_rom[56] = 16'b1101101100000010; // ADDI R11,R0,2   col=2
+    program_rom[57] = 16'b1011101111001111; // DRAW col=R11,row=R12,clr=R15
+    program_rom[58] = 16'b1101110000000010; // ADDI R12,R0,2   row=2
+    program_rom[59] = 16'b1101101100000001; // ADDI R11,R0,1
+    program_rom[60] = 16'b1011101111001111; // DRAW col=R11,row=R12,clr=R15
+    program_rom[61] = 16'b1101101100000010; // ADDI R11,R0,2
+    program_rom[62] = 16'b1011101111001111; // DRAW col=R11,row=R12,clr=R15
+    // Clouds: row=4 cols 7,8,9 white(R1)
+    program_rom[63] = 16'b1101110000000100; // ADDI R12,R0,4   row=4
+    program_rom[64] = 16'b1101101100000111; // ADDI R11,R0,7
+    program_rom[65] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+    program_rom[66] = 16'b1101101100001000; // ADDI R11,R0,8
+    program_rom[67] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+    program_rom[68] = 16'b1101101100001001; // ADDI R11,R0,9
+    program_rom[69] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+    // Cloud 2: row=7 cols 20,21,22
+    program_rom[70] = 16'b1101110000000111; // ADDI R12,R0,7
+    program_rom[71] = 16'b1101101100010100; // ADDI R11,R0,20
+    program_rom[72] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+    program_rom[73] = 16'b1101101100010101; // ADDI R11,R0,21
+    program_rom[74] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+    program_rom[75] = 16'b1101101100010110; // ADDI R11,R0,22
+    program_rom[76] = 16'b1011101111000001; // DRAW col=R11,row=R12,clr=R1
+
+    // ── DRAW INITIAL PLUS (pc=77) ─────────────────────────────────────────────
+    // col=R5(X), row=R6(Y), colour=R1(white)
+    program_rom[77] = 16'b1011010101100001; // DRAW col=R5,row=R6,clr=R1  centre
+    program_rom[78] = 16'b1101110001101111; // ADDI R12,R6,-1  row above
+   program_rom[79] = 16'b1011010111000001; // DRAW col=R5,row=R12,clr=R1 up
+    program_rom[79] = 16'b1011010111000001; // DRAW col=R5,row=R12,clr=R1 up (R12)
+    program_rom[80] = 16'b1101110001100001; // ADDI R12,R6,+1  row below
+    program_rom[81] = 16'b1011010111000001; // DRAW col=R5,row=R12,clr=R1 down
+    program_rom[82] = 16'b1101101101011111; // ADDI R11,R5,-1  col left
+    program_rom[83] = 16'b1011101101100001; // DRAW col=R11,row=R6,clr=R1 left
+    program_rom[84] = 16'b1101101101010001; // ADDI R11,R5,+1  col right
+    program_rom[85] = 16'b1011101101100001; // DRAW col=R11,row=R6,clr=R1 right
+
+    // ── VSYNC WAIT (pc=86) ────────────────────────────────────────────────────
+    // Exact same bytes as working cross pc39-42
+    program_rom[86] = 16'b1110111000000000; // LOAD R14
+    program_rom[87] = 16'b1001111000001110; // BEQ R14,R0,-2   wait vsync HIGH -> pc=86
+    program_rom[88] = 16'b1110111000000000; // LOAD R14
+    program_rom[89] = 16'b1010000011101110; // BLT R0,R14,-2   (broken but harmless)
+
+    // ── FRAME GATE (pc=90) ────────────────────────────────────────────────────
+    // R8=frame counter, R9=gate limit(8)
+    // Pattern: cnt++, BEQ cnt,limit,+1(skip JMP), JMP vsync
+    program_rom[90] = 16'b1101100010000001; // ADDI R8,R8,1    cnt++
+    // BEQ R8,R9,+1: if cnt==8 skip JMP -> fall to erase
+    // opcode=1001, rd=R8=1000, rs1=R9=1001, imm=0001
+    program_rom[91] = 16'b1001100010010001; // BEQ R8,R9,+1
+    program_rom[92] = 16'b1000000001010110; // JMP 86          back to vsync
+    program_rom[93] = 16'b1101100000000000; // ADDI R8,R0,0    reset cnt
+
+    // ── ERASE PLUS (pc=94) ────────────────────────────────────────────────────
+    // Erase colour: R6=14 which is sky zone (<23), so R10=R2 always for Y=14
+    program_rom[94] = 16'b0001101000100000; // ADD R10,R2,R0   erase=sky
+    program_rom[95] = 16'b1011010101101010; // DRAW col=R5,row=R6,clr=R10  centre
+    program_rom[96] = 16'b1101110001101111; // ADDI R12,R6,-1
+    program_rom[97] = 16'b1011010111001010; // DRAW col=R5,row=R12,clr=R10 up
+    program_rom[98] = 16'b1101110001100001; // ADDI R12,R6,+1
+    program_rom[99] = 16'b1011010111001010; // DRAW col=R5,row=R12,clr=R10 down
+    program_rom[100]= 16'b1101101101011111; // ADDI R11,R5,-1
+    program_rom[101]= 16'b1011101101101010; // DRAW col=R11,row=R6,clr=R10 left
+    program_rom[102]= 16'b1101101101010001; // ADDI R11,R5,+1
+    program_rom[103]= 16'b1011101101101010; // DRAW col=R11,row=R6,clr=R10 right
+
+    // ── MOVE (pc=104) ─────────────────────────────────────────────────────────
+    // BEQ R7,R0,+2: if dir=0(left) skip X++ -> fall to X--
+    // opcode=1001, rd=R7=0111, rs1=R0=0000, imm=0010(+2)
+    program_rom[104]= 16'b1001011100000010; // BEQ R7,R0,+2
+    program_rom[105]= 16'b1101010101010001; // ADDI R5,R5,1    X++
+    program_rom[106]= 16'b1000000001101100; // JMP 108
+    program_rom[107]= 16'b1101010101011111; // ADDI R5,R5,-1   X--
+
+    // Boundary right: X>=30 turn left
+    // SETX R15,30; BEQ R5,R15,+1: if X==30 skip JMP; JMP 112(next check)
+    program_rom[108]= 16'b1100111100011110; // SETX R15,30
+    program_rom[109]= 16'b1001010111110001; // BEQ R5,R15,+1   if X==30 skip
+    program_rom[110]= 16'b1000000001110000; // JMP 112
+    program_rom[111]= 16'b1101011100000000; // ADDI R7,R0,0    dir=left
+
+    // Boundary left: X==1 turn right
+    program_rom[112]= 16'b1100111100000001; // SETX R15,1
+    program_rom[113]= 16'b1001010111110001; // BEQ R5,R15,+1   if X==1 skip
+    program_rom[114]= 16'b1000000001110011; // JMP 115
+    program_rom[115]= 16'b1101011100000001; // ADDI R7,R0,1    dir=right -- wait pc clash
+    // Fix: boundary left falls through or jumps past
+    program_rom[114]= 16'b1000000001110011; // JMP 115
+    program_rom[115]= 16'b1101011100000001; // ADDI R7,R0,1    dir=right
+
+    // ── DRAW PLUS AT NEW POS (pc=116) ─────────────────────────────────────────
+    program_rom[116]= 16'b1011010101100001; // DRAW col=R5,row=R6,clr=R1  centre
+    program_rom[117]= 16'b1101110001101111; // ADDI R12,R6,-1
+    program_rom[118]= 16'b1011010111000001; // DRAW col=R5,row=R12,clr=R1 up
+    program_rom[119]= 16'b1101110001100001; // ADDI R12,R6,+1
+    program_rom[120]= 16'b1011010111000001; // DRAW col=R5,row=R12,clr=R1 down
+    program_rom[121]= 16'b1101101101011111; // ADDI R11,R5,-1
+    program_rom[122]= 16'b1011101101100001; // DRAW col=R11,row=R6,clr=R1 left
+    program_rom[123]= 16'b1101101101010001; // ADDI R11,R5,+1
+    program_rom[124]= 16'b1011101101100001; // DRAW col=R11,row=R6,clr=R1 right
+
+    program_rom[125]= 16'b1000000001010110; // JMP 86   back to vsync
+end
+
+reg [15:0] registers [0:15];
+reg [7:0]  pc;
+integer ri;
+initial begin pc=0; for(ri=0;ri<16;ri=ri+1) registers[ri]=0; end
+
+wire [15:0] instr      = program_rom[pc];
+wire [3:0]  opcode     = instr[15:12];
+wire [3:0]  rd         = instr[11:8];
+wire [3:0]  rs1        = instr[7:4];
+wire [3:0]  rs2_or_imm = instr[3:0];
+wire [7:0]  imm8       = instr[7:0];
+wire [11:0] addr12     = instr[11:0];
+wire signed [7:0]  br_offs   = {{4{rs2_or_imm[3]}},rs2_or_imm};
+wire signed [15:0] s_rs1_val = registers[rs1];
+
+parameter CPU_DIV = 4;
+reg [19:0] cpu_cnt = 0;
+wire cpu_tick = (cpu_cnt == CPU_DIV-1);
+always @(posedge clk)
+    cpu_cnt <= (rst||cpu_tick) ? 0 : cpu_cnt+1;
+
+always @(posedge clk) begin
+    if (rst) begin
+        pc <= 0;
+        for (ri=0;ri<16;ri=ri+1) registers[ri]<=0;
+    end else if (cpu_tick) begin
+        case (opcode)
+            4'b0000: pc<=pc+1;
+            4'b0001: begin registers[rd]<=registers[rs1]+registers[rs2_or_imm]; pc<=pc+1; end
+            4'b0010: begin registers[rd]<=registers[rs1]-registers[rs2_or_imm]; pc<=pc+1; end
+            4'b0011: begin registers[rd]<=registers[rs1]&registers[rs2_or_imm]; pc<=pc+1; end
+            4'b0100: begin registers[rd]<=registers[rs1]|registers[rs2_or_imm]; pc<=pc+1; end
+            4'b0101: begin registers[rd]<=~registers[rs1]; pc<=pc+1; end
+            4'b0110: begin registers[rd]<=registers[rs1]<<rs2_or_imm; pc<=pc+1; end
+            4'b0111: begin registers[rd]<=registers[rs1]>>rs2_or_imm; pc<=pc+1; end
+            4'b1000: pc<=addr12[7:0];
+            4'b1001: begin
+                if(registers[rd]==registers[rs1]) pc<=pc+1+br_offs;
+                else pc<=pc+1;
+            end
+            4'b1010: begin
+                if(s_rs1_val<$signed(registers[rs2_or_imm])) pc<=pc+1+br_offs;
+                else pc<=pc+1;
+            end
+            4'b1011: begin
+                if(registers[rs1][4:0]<30 && registers[rd][4:0]<32)
+                    framebuffer[registers[rs1][4:0]][registers[rd][4:0]]<=registers[rs2_or_imm][11:0];
+                pc<=pc+1;
+            end
+            4'b1100: begin registers[rd]<={8'h00,imm8}; pc<=pc+1; end
+            4'b1101: begin registers[rd]<=registers[rs1]+{{12{rs2_or_imm[3]}},rs2_or_imm}; pc<=pc+1; end
+            4'b1110: begin registers[rd]<={15'b0,vsync_active}; pc<=pc+1; end
+            4'b1111: pc<=pc;
+            default: pc<=pc+1;
+        endcase
+    end
+end
+
+always @(posedge clk) begin
+    if (video_on) {Red,Green,Blue} <= framebuffer[tile_row][tile_col];
+    else          {Red,Green,Blue} <= 12'h000;
+end
+
+endmodule
