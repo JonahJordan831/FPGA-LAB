@@ -1,0 +1,54 @@
+`timescale 1ns / 1ps
+module tb;
+
+reg clk = 0;
+reg btnU = 0, btnD = 0, btnL = 0, btnR = 1;
+wire Hsync, Vsync;
+wire [3:0] Red, Green, Blue;
+
+top uut (
+    .clk(clk),
+    .btnU(btnU), .btnD(btnD), .btnL(btnL), .btnR(btnR),
+    .Hsync(Hsync), .Vsync(Vsync),
+    .Red(Red), .Green(Green), .Blue(Blue)
+);
+
+always #5 clk = ~clk;
+
+initial begin
+    $display("t=0 START");
+
+    // Background paint takes ~30*32*4 = ~3840 CPU ticks * 4 = ~15360 clk cycles
+    // VGA frame = 800*525 = 420000 pixel ticks * 4 = 1.68M clk cycles
+    // Run 50M ns = 50ms = 5M clock cycles to get through init + several frames
+
+    #50000;
+    $display("t=%0t pc=%0d R5=%0d R6=%0d R7=%0d R8=%0d vsync=%0d",
+        $time,uut.pc,uut.registers[5],uut.registers[6],
+        uut.registers[7],uut.registers[8],uut.vsync_active);
+
+    #500000;
+    $display("t=%0t pc=%0d R5=%0d R6=%0d R7=%0d R8=%0d vsync=%0d",
+        $time,uut.pc,uut.registers[5],uut.registers[6],
+        uut.registers[7],uut.registers[8],uut.vsync_active);
+
+    #5000000;
+    $display("t=%0t pc=%0d R5=%0d R6=%0d R7=%0d R8=%0d vsync=%0d",
+        $time,uut.pc,uut.registers[5],uut.registers[6],
+        uut.registers[7],uut.registers[8],uut.vsync_active);
+
+    #10000000;
+    $display("t=%0t pc=%0d R5=%0d R6=%0d R7=%0d R8=%0d vsync=%0d",
+        $time,uut.pc,uut.registers[5],uut.registers[6],
+        uut.registers[7],uut.registers[8],uut.vsync_active);
+
+    #30000000;
+    $display("t=%0t pc=%0d R5=%0d R6=%0d R7=%0d R8=%0d vsync=%0d",
+        $time,uut.pc,uut.registers[5],uut.registers[6],
+        uut.registers[7],uut.registers[8],uut.vsync_active);
+
+    $display("DONE");
+    $finish;
+end
+
+endmodule
