@@ -1,0 +1,402 @@
+`timescale 1ns / 1ps
+//=============================================================================
+// 2048 - Basys 3  VGA 640x480 60 Hz  100 MHz clk
+// BTNL=left  BTNR=right  BTNU=up  BTND=down  BTNC=new game
+//=============================================================================
+module top (
+    input  wire       clk,
+    input  wire       BTNC, BTNL, BTNR, BTNU, BTND,
+    output reg        Hsync, Vsync,
+    output reg  [3:0] Red, Green, Blue
+);
+
+//=============================================================================
+// 1. 25 MHz pixel clock
+//=============================================================================
+reg [1:0] clk_div = 2'd0;
+always @(posedge clk) clk_div <= clk_div + 2'd1;
+wire pclk = clk_div[1];
+
+//=============================================================================
+// 2. VGA 640x480 @ 60 Hz
+//=============================================================================
+reg [9:0] hcnt = 10'd0, vcnt = 10'd0;
+always @(posedge pclk) begin
+    if (hcnt == 10'd799) begin
+        hcnt <= 10'd0;
+        vcnt <= (vcnt == 10'd524) ? 10'd0 : vcnt + 10'd1;
+    end else
+        hcnt <= hcnt + 10'd1;
+end
+wire vid    = (hcnt < 10'd640) && (vcnt < 10'd480);
+wire vblank = (vcnt >= 10'd480);
+
+always @(posedge pclk) begin
+    Hsync <= ~((hcnt >= 10'd656) && (hcnt < 10'd752));
+    Vsync <= ~((vcnt >= 10'd490) && (vcnt < 10'd492));
+end
+
+//=============================================================================
+// 3. Button debounce (~10 ms @ 100 MHz)
+//=============================================================================
+reg [19:0] deb_cnt  = 20'd0;
+reg        deb_tick = 1'b0;
+always @(posedge clk) begin
+    if (deb_cnt == 20'd999_999) begin
+        deb_cnt <= 20'd0; deb_tick <= 1'b1;
+    end else begin
+        deb_cnt <= deb_cnt + 20'd1; deb_tick <= 1'b0;
+    end
+end
+reg [2:0] sr_c=0, sr_l=0, sr_r=0, sr_u=0, sr_d=0;
+always @(posedge clk) if (deb_tick) begin
+    sr_c <= {sr_c[1:0],BTNC}; sr_l <= {sr_l[1:0],BTNL};
+    sr_r <= {sr_r[1:0],BTNR}; sr_u <= {sr_u[1:0],BTNU};
+    sr_d <= {sr_d[1:0],BTND};
+end
+wire press_c = (sr_c[2:1]==2'b01);
+wire press_l = (sr_l[2:1]==2'b01);
+wire press_r = (sr_r[2:1]==2'b01);
+wire press_u = (sr_u[2:1]==2'b01);
+wire press_d = (sr_d[2:1]==2'b01);
+wire any_press = press_c|press_l|press_r|press_u|press_d;
+
+//=============================================================================
+// 4. LFSR (16-bit Galois, free-running)
+//=============================================================================
+reg [15:0] lfsr = 16'hACE1;
+always @(posedge clk)
+    lfsr <= {1'b0,lfsr[15:1]} ^ (lfsr[0] ? 16'hB400 : 16'h0);
+
+//=============================================================================
+// 5. Board  board[r*4+c], value=log2(tile), 0=empty
+//=============================================================================
+reg [3:0] board [0:15];
+integer ii;
+initial for (ii=0; ii<16; ii=ii+1) board[ii] = 4'd0;
+
+//=============================================================================
+// 6. Slide engine
+//    compress -> merge -> compress via task.
+//    IMPORTANT: merge uses else-if chain so only ONE merge fires per
+//    position per slide. This prevents (2,2,4) collapsing to 8 in one move.
+//=============================================================================
+localparam [1:0] DIR_L=0, DIR_R=1, DIR_U=2, DIR_D=3;
+reg [1:0] cur_dir = DIR_L;
+
+reg [3:0] sl_out [0:15];
+reg       sl_moved;
+
+reg [3:0] r0i0,r0i1,r0i2,r0i3, r0o0,r0o1,r0o2,r0o3;
+reg [3:0] r1i0,r1i1,r1i2,r1i3, r1o0,r1o1,r1o2,r1o3;
+reg [3:0] r2i0,r2i1,r2i2,r2i3, r2o0,r2o1,r2o2,r2o3;
+reg [3:0] r3i0,r3i1,r3i2,r3i3, r3o0,r3o1,r3o2,r3o3;
+
+task cmc;
+    input  [3:0] i0,i1,i2,i3;
+    output [3:0] o0,o1,o2,o3;
+    reg [3:0] c0,c1,c2,c3;
+    reg [3:0] m0,m1,m2,m3;
+    begin
+        // compress 1 - pack non-zero values left
+        c0=4'd0; c1=4'd0; c2=4'd0; c3=4'd0;
+        if      (i0!=0&&i1!=0&&i2!=0&&i3!=0) begin c0=i0;c1=i1;c2=i2;c3=i3; end
+        else if (i0!=0&&i1!=0&&i2!=0)        begin c0=i0;c1=i1;c2=i2; end
+        else if (i0!=0&&i1!=0&&i3!=0)        begin c0=i0;c1=i1;c2=i3; end
+        else if (i0!=0&&i2!=0&&i3!=0)        begin c0=i0;c1=i2;c2=i3; end
+        else if (i1!=0&&i2!=0&&i3!=0)        begin c0=i1;c1=i2;c2=i3; end
+        else if (i0!=0&&i1!=0)               begin c0=i0;c1=i1; end
+        else if (i0!=0&&i2!=0)               begin c0=i0;c1=i2; end
+        else if (i0!=0&&i3!=0)               begin c0=i0;c1=i3; end
+        else if (i1!=0&&i2!=0)               begin c0=i1;c1=i2; end
+        else if (i1!=0&&i3!=0)               begin c0=i1;c1=i3; end
+        else if (i2!=0&&i3!=0)               begin c0=i2;c1=i3; end
+        else if (i0!=0)                      begin c0=i0; end
+        else if (i1!=0)                      begin c0=i1; end
+        else if (i2!=0)                      begin c0=i2; end
+        else if (i3!=0)                      begin c0=i3; end
+
+        // merge - else-if ensures at most ONE merge fires per slide
+        m0=c0; m1=c1; m2=c2; m3=c3;
+        if      (m0!=0 && m0==m1) begin m0=m0+4'd1; m1=m2; m2=m3; m3=4'd0; end
+        else if (m1!=0 && m1==m2) begin m1=m1+4'd1; m2=m3; m3=4'd0; end
+        else if (m2!=0 && m2==m3) begin m2=m2+4'd1; m3=4'd0; end
+
+        // compress 2 - pack again after merge
+        o0=4'd0; o1=4'd0; o2=4'd0; o3=4'd0;
+        if      (m0!=0&&m1!=0&&m2!=0&&m3!=0) begin o0=m0;o1=m1;o2=m2;o3=m3; end
+        else if (m0!=0&&m1!=0&&m2!=0)        begin o0=m0;o1=m1;o2=m2; end
+        else if (m0!=0&&m1!=0&&m3!=0)        begin o0=m0;o1=m1;o2=m3; end
+        else if (m0!=0&&m2!=0&&m3!=0)        begin o0=m0;o1=m2;o2=m3; end
+        else if (m1!=0&&m2!=0&&m3!=0)        begin o0=m1;o1=m2;o2=m3; end
+        else if (m0!=0&&m1!=0)               begin o0=m0;o1=m1; end
+        else if (m0!=0&&m2!=0)               begin o0=m0;o1=m2; end
+        else if (m0!=0&&m3!=0)               begin o0=m0;o1=m3; end
+        else if (m1!=0&&m2!=0)               begin o0=m1;o1=m2; end
+        else if (m1!=0&&m3!=0)               begin o0=m1;o1=m3; end
+        else if (m2!=0&&m3!=0)               begin o0=m2;o1=m3; end
+        else if (m0!=0)                      begin o0=m0; end
+        else if (m1!=0)                      begin o0=m1; end
+        else if (m2!=0)                      begin o0=m2; end
+        else if (m3!=0)                      begin o0=m3; end
+    end
+endtask
+
+always @(*) begin : slide_comb
+    sl_moved = 1'b0;
+
+    case (cur_dir)
+        DIR_L: begin
+            r0i0=board[0];  r0i1=board[1];  r0i2=board[2];  r0i3=board[3];
+            r1i0=board[4];  r1i1=board[5];  r1i2=board[6];  r1i3=board[7];
+            r2i0=board[8];  r2i1=board[9];  r2i2=board[10]; r2i3=board[11];
+            r3i0=board[12]; r3i1=board[13]; r3i2=board[14]; r3i3=board[15];
+        end
+        DIR_R: begin
+            r0i0=board[3];  r0i1=board[2];  r0i2=board[1];  r0i3=board[0];
+            r1i0=board[7];  r1i1=board[6];  r1i2=board[5];  r1i3=board[4];
+            r2i0=board[11]; r2i1=board[10]; r2i2=board[9];  r2i3=board[8];
+            r3i0=board[15]; r3i1=board[14]; r3i2=board[13]; r3i3=board[12];
+        end
+        DIR_U: begin
+            r0i0=board[0];  r0i1=board[4];  r0i2=board[8];  r0i3=board[12];
+            r1i0=board[1];  r1i1=board[5];  r1i2=board[9];  r1i3=board[13];
+            r2i0=board[2];  r2i1=board[6];  r2i2=board[10]; r2i3=board[14];
+            r3i0=board[3];  r3i1=board[7];  r3i2=board[11]; r3i3=board[15];
+        end
+        default: begin // DIR_D
+            r0i0=board[12]; r0i1=board[8];  r0i2=board[4];  r0i3=board[0];
+            r1i0=board[13]; r1i1=board[9];  r1i2=board[5];  r1i3=board[1];
+            r2i0=board[14]; r2i1=board[10]; r2i2=board[6];  r2i3=board[2];
+            r3i0=board[15]; r3i1=board[11]; r3i2=board[7];  r3i3=board[3];
+        end
+    endcase
+
+    cmc(r0i0,r0i1,r0i2,r0i3, r0o0,r0o1,r0o2,r0o3);
+    cmc(r1i0,r1i1,r1i2,r1i3, r1o0,r1o1,r1o2,r1o3);
+    cmc(r2i0,r2i1,r2i2,r2i3, r2o0,r2o1,r2o2,r2o3);
+    cmc(r3i0,r3i1,r3i2,r3i3, r3o0,r3o1,r3o2,r3o3);
+
+    case (cur_dir)
+        DIR_L: begin
+            sl_out[0]=r0o0;  sl_out[1]=r0o1;  sl_out[2]=r0o2;  sl_out[3]=r0o3;
+            sl_out[4]=r1o0;  sl_out[5]=r1o1;  sl_out[6]=r1o2;  sl_out[7]=r1o3;
+            sl_out[8]=r2o0;  sl_out[9]=r2o1;  sl_out[10]=r2o2; sl_out[11]=r2o3;
+            sl_out[12]=r3o0; sl_out[13]=r3o1; sl_out[14]=r3o2; sl_out[15]=r3o3;
+        end
+        DIR_R: begin
+            sl_out[3]=r0o0;  sl_out[2]=r0o1;  sl_out[1]=r0o2;  sl_out[0]=r0o3;
+            sl_out[7]=r1o0;  sl_out[6]=r1o1;  sl_out[5]=r1o2;  sl_out[4]=r1o3;
+            sl_out[11]=r2o0; sl_out[10]=r2o1; sl_out[9]=r2o2;  sl_out[8]=r2o3;
+            sl_out[15]=r3o0; sl_out[14]=r3o1; sl_out[13]=r3o2; sl_out[12]=r3o3;
+        end
+        DIR_U: begin
+            sl_out[0]=r0o0;  sl_out[4]=r0o1;  sl_out[8]=r0o2;  sl_out[12]=r0o3;
+            sl_out[1]=r1o0;  sl_out[5]=r1o1;  sl_out[9]=r1o2;  sl_out[13]=r1o3;
+            sl_out[2]=r2o0;  sl_out[6]=r2o1;  sl_out[10]=r2o2; sl_out[14]=r2o3;
+            sl_out[3]=r3o0;  sl_out[7]=r3o1;  sl_out[11]=r3o2; sl_out[15]=r3o3;
+        end
+        default: begin // DIR_D
+            sl_out[12]=r0o0; sl_out[8]=r0o1;  sl_out[4]=r0o2;  sl_out[0]=r0o3;
+            sl_out[13]=r1o0; sl_out[9]=r1o1;  sl_out[5]=r1o2;  sl_out[1]=r1o3;
+            sl_out[14]=r2o0; sl_out[10]=r2o1; sl_out[6]=r2o2;  sl_out[2]=r2o3;
+            sl_out[15]=r3o0; sl_out[11]=r3o1; sl_out[7]=r3o2;  sl_out[3]=r3o3;
+        end
+    endcase
+
+    if (sl_out[0] !=board[0]  || sl_out[1] !=board[1]  ||
+        sl_out[2] !=board[2]  || sl_out[3] !=board[3]  ||
+        sl_out[4] !=board[4]  || sl_out[5] !=board[5]  ||
+        sl_out[6] !=board[6]  || sl_out[7] !=board[7]  ||
+        sl_out[8] !=board[8]  || sl_out[9] !=board[9]  ||
+        sl_out[10]!=board[10] || sl_out[11]!=board[11] ||
+        sl_out[12]!=board[12] || sl_out[13]!=board[13] ||
+        sl_out[14]!=board[14] || sl_out[15]!=board[15])
+        sl_moved = 1'b1;
+end
+
+//=============================================================================
+// 7. Free-cell scan (combinatorial)
+//=============================================================================
+reg [3:0] free_list [0:15];
+reg [4:0] free_cnt;
+integer   fc;
+always @(*) begin : free_scan
+    free_cnt = 5'd0;
+    for (fc=0; fc<16; fc=fc+1) begin
+        free_list[fc] = 4'd0;
+        if (board[fc]==4'd0) begin
+            free_list[free_cnt] = fc[3:0];
+            free_cnt = free_cnt + 5'd1;
+        end
+    end
+end
+
+reg    cm;
+integer cmr, cmc2;
+always @(*) begin : can_move_blk
+    cm = 1'b0;
+    for (cmr=0; cmr<4; cmr=cmr+1)
+        for (cmc2=0; cmc2<4; cmc2=cmc2+1) begin
+            if (board[cmr*4+cmc2]==4'd0) cm=1'b1;
+            if (cmc2<3 && board[cmr*4+cmc2]!=4'd0 &&
+                board[cmr*4+cmc2]==board[cmr*4+cmc2+1]) cm=1'b1;
+            if (cmr<3  && board[cmr*4+cmc2]!=4'd0 &&
+                board[cmr*4+cmc2]==board[(cmr+1)*4+cmc2]) cm=1'b1;
+        end
+end
+
+//=============================================================================
+// 8. FSM
+//=============================================================================
+localparam [2:0]
+    ST_INIT=3'd0, ST_IDLE=3'd1, ST_SLIDE=3'd2,
+    ST_SETTLE=3'd3, ST_SPAWN=3'd4, ST_OVER=3'd5;
+
+reg [2:0] state     = ST_INIT;
+reg [2:0] init_step = 3'd0;
+reg [3:0] _ridx;
+integer   fi;
+
+always @(posedge clk) begin : fsm
+    case (state)
+
+    ST_INIT: begin
+        case (init_step)
+        3'd0: begin
+            for (fi=0; fi<16; fi=fi+1) board[fi] <= 4'd0;
+            init_step <= 3'd1;
+        end
+        3'd1: begin
+            case (lfsr[3:0])
+                4'd0: board[0] <=4'd1;  4'd1: board[1] <=4'd1;
+                4'd2: board[2] <=4'd1;  4'd3: board[3] <=4'd1;
+                4'd4: board[4] <=4'd1;  4'd5: board[5] <=4'd1;
+                4'd6: board[6] <=4'd1;  4'd7: board[7] <=4'd1;
+                4'd8: board[8] <=4'd1;  4'd9: board[9] <=4'd1;
+                4'd10:board[10]<=4'd1;  4'd11:board[11]<=4'd1;
+                4'd12:board[12]<=4'd1;  4'd13:board[13]<=4'd1;
+                4'd14:board[14]<=4'd1;  default:board[15]<=4'd1;
+            endcase
+            init_step <= 3'd2;
+        end
+        3'd2: begin
+            case (lfsr[7:4])
+                4'd0: board[0] <=4'd1;  4'd1: board[1] <=4'd1;
+                4'd2: board[2] <=4'd1;  4'd3: board[3] <=4'd1;
+                4'd4: board[4] <=4'd1;  4'd5: board[5] <=4'd1;
+                4'd6: board[6] <=4'd1;  4'd7: board[7] <=4'd1;
+                4'd8: board[8] <=4'd1;  4'd9: board[9] <=4'd1;
+                4'd10:board[10]<=4'd1;  4'd11:board[11]<=4'd1;
+                4'd12:board[12]<=4'd1;  4'd13:board[13]<=4'd1;
+                4'd14:board[14]<=4'd1;  default:board[15]<=4'd1;
+            endcase
+            init_step <= 3'd0;
+            state     <= ST_IDLE;
+        end
+        default: state <= ST_IDLE;
+        endcase
+    end
+
+    ST_IDLE: begin
+        if (press_c) begin
+            state <= ST_INIT; init_step <= 3'd0;
+        end else if (press_l||press_r||press_u||press_d) begin
+            cur_dir <= press_l ? DIR_L :
+                       press_r ? DIR_R :
+                       press_u ? DIR_U : DIR_D;
+            state   <= ST_SLIDE;
+        end
+    end
+
+    ST_SLIDE: begin
+        if (sl_moved) begin
+            for (fi=0; fi<16; fi=fi+1) board[fi] <= sl_out[fi];
+            state <= ST_SETTLE;
+        end else
+            state <= ST_IDLE;
+    end
+
+    ST_SETTLE: begin
+        state <= ST_SPAWN;
+    end
+
+    ST_SPAWN: begin
+        if (free_cnt > 5'd0) begin
+            _ridx = lfsr[3:0];
+            if (_ridx >= free_cnt[3:0]) _ridx = _ridx - free_cnt[3:0];
+            if (_ridx >= free_cnt[3:0]) _ridx = _ridx - free_cnt[3:0];
+            if (_ridx >= free_cnt[3:0]) _ridx = 4'd0;
+            case (free_list[_ridx])
+                4'd0: board[0] <=4'd1;  4'd1: board[1] <=4'd1;
+                4'd2: board[2] <=4'd1;  4'd3: board[3] <=4'd1;
+                4'd4: board[4] <=4'd1;  4'd5: board[5] <=4'd1;
+                4'd6: board[6] <=4'd1;  4'd7: board[7] <=4'd1;
+                4'd8: board[8] <=4'd1;  4'd9: board[9] <=4'd1;
+                4'd10:board[10]<=4'd1;  4'd11:board[11]<=4'd1;
+                4'd12:board[12]<=4'd1;  4'd13:board[13]<=4'd1;
+                4'd14:board[14]<=4'd1;  default:board[15]<=4'd1;
+            endcase
+        end
+        state <= cm ? ST_IDLE : ST_OVER;
+    end
+
+    ST_OVER: begin
+        if (any_press) begin state <= ST_INIT; init_step <= 3'd0; end
+    end
+
+    default: state <= ST_IDLE;
+    endcase
+end
+
+//=============================================================================
+// 9. VGA Renderer
+//    BX=95, BY=15. Slot=110px (10px gap + 100px cell). 4x110=440px board.
+//=============================================================================
+localparam [9:0] BX = 10'd95, BY = 10'd15;
+
+reg [24:0] ov_cnt = 25'd0;
+always @(posedge clk)
+    ov_cnt <= (state==ST_OVER) ? ov_cnt+25'd1 : 25'd0;
+wire over_flash = (state==ST_OVER) && ov_cnt[24];
+
+wire        in_board = (hcnt>=BX)&&(hcnt<BX+440)&&(vcnt>=BY)&&(vcnt<BY+440);
+wire [9:0]  bx_off   = hcnt - BX;
+wire [9:0]  by_off   = vcnt - BY;
+wire [1:0]  tile_col = bx_off / 10'd110;
+wire [1:0]  tile_row = by_off / 10'd110;
+wire [9:0]  cell_x   = bx_off % 10'd110;
+wire [9:0]  cell_y   = by_off % 10'd110;
+wire        in_cell  = in_board && (cell_x>=10'd10) && (cell_y>=10'd10);
+wire [3:0]  tile_idx = {tile_row, tile_col};
+wire [3:0]  tile_val = board[tile_idx];
+
+reg [11:0] tile_rgb;
+always @(*) begin
+    if (over_flash && in_cell && tile_val!=4'd0)
+        tile_rgb = 12'hF00;
+    else case (tile_val)
+        4'd1:  tile_rgb=12'hEDA;
+        4'd2:  tile_rgb=12'hEC8;
+        4'd3:  tile_rgb=12'hF94;
+        4'd4:  tile_rgb=12'hF72;
+        4'd5:  tile_rgb=12'hF54;
+        4'd6:  tile_rgb=12'hF30;
+        4'd7:  tile_rgb=12'hFC5;
+        4'd8:  tile_rgb=12'hFB3;
+        4'd9:  tile_rgb=12'hFA1;
+        4'd10: tile_rgb=12'hF90;
+        4'd11: tile_rgb=12'hFF3;
+        default: tile_rgb=12'hCBB;
+    endcase
+end
+
+wire [11:0] pix =
+    ~vid     ? 12'h000 :
+    in_cell  ? tile_rgb :
+    in_board ? 12'hA87 :
+               12'h211;
+
+always @(posedge pclk) {Red,Green,Blue} <= pix;
+
+endmodule
