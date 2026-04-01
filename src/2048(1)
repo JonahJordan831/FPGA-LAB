@@ -1,0 +1,349 @@
+`timescale 1ns / 1ps
+//=============================================================================
+// 2048 for Basys 3  —  VGA 640x480 @ 60 Hz, 100 MHz input clock
+// BTNU=up  BTND=down  BTNL=left  BTNR=right  BTNC=new game
+//=============================================================================
+module top (
+    input  wire       clk,
+    input  wire       BTNC, BTNL, BTNR, BTNU, BTND,
+    output reg        Hsync, Vsync,
+    output reg  [3:0] Red, Green, Blue
+);
+
+// 1. 25 MHz pixel clock
+reg [1:0] clk_div = 0;
+always @(posedge clk) clk_div <= clk_div + 1;
+wire pclk = clk_div[1];
+
+// 2. VGA 640x480 @ 60 Hz
+reg [9:0] hcnt = 0, vcnt = 0;
+always @(posedge pclk) begin
+    if (hcnt == 10'd799) begin
+        hcnt <= 0;
+        vcnt <= (vcnt == 10'd524) ? 10'd0 : vcnt + 1;
+    end else
+        hcnt <= hcnt + 1;
+end
+wire vid = (hcnt < 640) && (vcnt < 480);
+always @(posedge pclk) begin
+    Hsync <= ~((hcnt >= 656) && (hcnt < 752));
+    Vsync <= ~((vcnt >= 490) && (vcnt < 492));
+end
+
+// 3. Button debounce (~10 ms)
+reg [19:0] deb_cnt  = 0;
+reg        deb_tick = 0;
+always @(posedge clk) begin
+    if (deb_cnt == 20'd999999) begin deb_cnt <= 0; deb_tick <= 1; end
+    else                       begin deb_cnt <= deb_cnt+1; deb_tick <= 0; end
+end
+reg [2:0] sr_c=0,sr_l=0,sr_r=0,sr_u=0,sr_d=0;
+always @(posedge clk) if (deb_tick) begin
+    sr_c <= {sr_c[1:0],BTNC}; sr_l <= {sr_l[1:0],BTNL};
+    sr_r <= {sr_r[1:0],BTNR}; sr_u <= {sr_u[1:0],BTNU};
+    sr_d <= {sr_d[1:0],BTND};
+end
+wire press_c = (sr_c[2:1]==2'b01), press_l = (sr_l[2:1]==2'b01);
+wire press_r = (sr_r[2:1]==2'b01), press_u = (sr_u[2:1]==2'b01);
+wire press_d = (sr_d[2:1]==2'b01);
+
+// 4. 16-bit Galois LFSR — free-running random source
+reg [15:0] lfsr = 16'hACE1;
+always @(posedge clk)
+    lfsr <= {1'b0, lfsr[15:1]} ^ (lfsr[0] ? 16'hB400 : 16'h0000);
+
+// 5. Board — value = power-of-2 exponent (0=empty, 1=2, 2=4, ... 11=2048)
+reg [3:0] board [0:15];
+integer   bi;
+initial begin for (bi=0; bi<16; bi=bi+1) board[bi]=4'd0; end
+
+// 6. merge4 task
+task merge4;
+    input  [3:0] a,b,c,d;
+    output [3:0] p,q,r,s,sc;
+    reg [3:0] t0,t1,t2,t3;
+    reg [1:0] wi;
+    begin
+        t0=0;t1=0;t2=0;t3=0;wi=0;sc=0;
+        if(a)begin case(wi)2'd0:t0=a;2'd1:t1=a;2'd2:t2=a;default:t3=a;endcase wi=wi+1;end
+        if(b)begin case(wi)2'd0:t0=b;2'd1:t1=b;2'd2:t2=b;default:t3=b;endcase wi=wi+1;end
+        if(c)begin case(wi)2'd0:t0=c;2'd1:t1=c;2'd2:t2=c;default:t3=c;endcase wi=wi+1;end
+        if(d)begin case(wi)2'd0:t0=d;2'd1:t1=d;2'd2:t2=d;default:t3=d;endcase end
+        if(t0&&t0==t1)begin t0=t0+1;sc=t0;t1=t2;t2=t3;t3=0;end
+        if(t1&&t1==t2)begin t1=t1+1;if(!sc)sc=t1;t2=t3;t3=0;end
+        p=t0;q=t1;r=t2;s=t3;
+    end
+endtask
+
+// 7. Combinatorial helpers
+reg [3:0] free_list [0:15];
+reg [4:0] free_cnt;
+always @(*) begin : free_scan
+    integer ff;
+    free_cnt = 0;
+    for (ff=0; ff<16; ff=ff+1) begin
+        free_list[ff] = 4'd0;
+        if (board[ff] == 4'd0) begin
+            free_list[free_cnt] = ff[3:0];
+            free_cnt = free_cnt + 1;
+        end
+    end
+end
+
+reg cm;
+always @(*) begin : can_move_blk
+    integer mm,nn;
+    cm=0;
+    for(mm=0;mm<4;mm=mm+1)
+        for(nn=0;nn<4;nn=nn+1) begin
+            if(board[mm*4+nn]==0) cm=1;
+            if(nn<3&&board[mm*4+nn]!=0&&board[mm*4+nn]==board[mm*4+nn+1]) cm=1;
+            if(mm<3&&board[mm*4+nn]!=0&&board[mm*4+nn]==board[(mm+1)*4+nn]) cm=1;
+        end
+end
+
+// 8. FSM
+localparam [2:0]
+    ST_INIT=3'd0, ST_IDLE=3'd1, ST_SLIDE=3'd2,
+    ST_WAIT=3'd3, ST_SPAWN=3'd4, ST_OVER=3'd5;
+localparam [1:0] DIR_L=0,DIR_R=1,DIR_U=2,DIR_D=3;
+
+reg [2:0] state=ST_INIT, init_step=0;
+reg [1:0] dir=0;
+reg [3:0] score_exp=0;
+reg       moved=0;
+reg [3:0] _p,_q,_r,_s,_sc;
+reg [3:0] _ridx;
+reg [3:0] nb [0:15];
+reg [3:0] spawn_cell;
+reg       spawn_valid;
+
+always @(posedge clk) begin
+    case (state)
+
+    ST_INIT: begin
+        case (init_step)
+            3'd0: begin
+                for(bi=0;bi<16;bi=bi+1) board[bi]<=4'd0;
+                score_exp<=0; init_step<=3'd1;
+            end
+            3'd1: begin
+                case(lfsr[3:0] % 4'd15)
+                    4'd0:board[0]<=4'd1;  4'd1:board[1]<=4'd1;
+                    4'd2:board[2]<=4'd1;  4'd3:board[3]<=4'd1;
+                    4'd4:board[4]<=4'd1;  4'd5:board[5]<=4'd1;
+                    4'd6:board[6]<=4'd1;  4'd7:board[7]<=4'd1;
+                    4'd8:board[8]<=4'd1;  4'd9:board[9]<=4'd1;
+                    4'd10:board[10]<=4'd1;4'd11:board[11]<=4'd1;
+                    4'd12:board[12]<=4'd1;4'd13:board[13]<=4'd1;
+                    default:board[14]<=4'd1;
+                endcase
+                init_step<=3'd2;
+            end
+            3'd2: begin
+                case(lfsr[7:4] % 4'd15)
+                    4'd0:board[0]<=4'd1;  4'd1:board[1]<=4'd1;
+                    4'd2:board[2]<=4'd1;  4'd3:board[3]<=4'd1;
+                    4'd4:board[4]<=4'd1;  4'd5:board[5]<=4'd1;
+                    4'd6:board[6]<=4'd1;  4'd7:board[7]<=4'd1;
+                    4'd8:board[8]<=4'd1;  4'd9:board[9]<=4'd1;
+                    4'd10:board[10]<=4'd1;4'd11:board[11]<=4'd1;
+                    4'd12:board[12]<=4'd1;4'd13:board[13]<=4'd1;
+                    default:board[14]<=4'd1;
+                endcase
+                init_step<=3'd0; state<=ST_IDLE;
+            end
+            default: state<=ST_IDLE;
+        endcase
+    end
+
+    ST_IDLE: begin
+        if      (press_c) begin state<=ST_INIT; init_step<=0; end
+        else if (press_l) begin dir<=DIR_L; state<=ST_SLIDE; end
+        else if (press_r) begin dir<=DIR_R; state<=ST_SLIDE; end
+        else if (press_u) begin dir<=DIR_U; state<=ST_SLIDE; end
+        else if (press_d) begin dir<=DIR_D; state<=ST_SLIDE; end
+    end
+
+    ST_SLIDE: begin
+        for(bi=0;bi<16;bi=bi+1) nb[bi]<=board[bi];
+        moved<=0;
+        case(dir)
+        DIR_L: begin
+            merge4(board[0],board[1],board[2],board[3],_p,_q,_r,_s,_sc);
+            nb[0]<=_p;nb[1]<=_q;nb[2]<=_r;nb[3]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[0],board[1],board[2],board[3]})moved<=1;
+            merge4(board[4],board[5],board[6],board[7],_p,_q,_r,_s,_sc);
+            nb[4]<=_p;nb[5]<=_q;nb[6]<=_r;nb[7]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[4],board[5],board[6],board[7]})moved<=1;
+            merge4(board[8],board[9],board[10],board[11],_p,_q,_r,_s,_sc);
+            nb[8]<=_p;nb[9]<=_q;nb[10]<=_r;nb[11]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[8],board[9],board[10],board[11]})moved<=1;
+            merge4(board[12],board[13],board[14],board[15],_p,_q,_r,_s,_sc);
+            nb[12]<=_p;nb[13]<=_q;nb[14]<=_r;nb[15]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[12],board[13],board[14],board[15]})moved<=1;
+        end
+        DIR_R: begin
+            merge4(board[3],board[2],board[1],board[0],_p,_q,_r,_s,_sc);
+            nb[3]<=_p;nb[2]<=_q;nb[1]<=_r;nb[0]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[3],board[2],board[1],board[0]})moved<=1;
+            merge4(board[7],board[6],board[5],board[4],_p,_q,_r,_s,_sc);
+            nb[7]<=_p;nb[6]<=_q;nb[5]<=_r;nb[4]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[7],board[6],board[5],board[4]})moved<=1;
+            merge4(board[11],board[10],board[9],board[8],_p,_q,_r,_s,_sc);
+            nb[11]<=_p;nb[10]<=_q;nb[9]<=_r;nb[8]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[11],board[10],board[9],board[8]})moved<=1;
+            merge4(board[15],board[14],board[13],board[12],_p,_q,_r,_s,_sc);
+            nb[15]<=_p;nb[14]<=_q;nb[13]<=_r;nb[12]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[15],board[14],board[13],board[12]})moved<=1;
+        end
+        DIR_U: begin
+            merge4(board[0],board[4],board[8],board[12],_p,_q,_r,_s,_sc);
+            nb[0]<=_p;nb[4]<=_q;nb[8]<=_r;nb[12]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[0],board[4],board[8],board[12]})moved<=1;
+            merge4(board[1],board[5],board[9],board[13],_p,_q,_r,_s,_sc);
+            nb[1]<=_p;nb[5]<=_q;nb[9]<=_r;nb[13]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[1],board[5],board[9],board[13]})moved<=1;
+            merge4(board[2],board[6],board[10],board[14],_p,_q,_r,_s,_sc);
+            nb[2]<=_p;nb[6]<=_q;nb[10]<=_r;nb[14]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[2],board[6],board[10],board[14]})moved<=1;
+            merge4(board[3],board[7],board[11],board[15],_p,_q,_r,_s,_sc);
+            nb[3]<=_p;nb[7]<=_q;nb[11]<=_r;nb[15]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[3],board[7],board[11],board[15]})moved<=1;
+        end
+        DIR_D: begin
+            merge4(board[12],board[8],board[4],board[0],_p,_q,_r,_s,_sc);
+            nb[12]<=_p;nb[8]<=_q;nb[4]<=_r;nb[0]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[12],board[8],board[4],board[0]})moved<=1;
+            merge4(board[13],board[9],board[5],board[1],_p,_q,_r,_s,_sc);
+            nb[13]<=_p;nb[9]<=_q;nb[5]<=_r;nb[1]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[13],board[9],board[5],board[1]})moved<=1;
+            merge4(board[14],board[10],board[6],board[2],_p,_q,_r,_s,_sc);
+            nb[14]<=_p;nb[10]<=_q;nb[6]<=_r;nb[2]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[14],board[10],board[6],board[2]})moved<=1;
+            merge4(board[15],board[11],board[7],board[3],_p,_q,_r,_s,_sc);
+            nb[15]<=_p;nb[11]<=_q;nb[7]<=_r;nb[3]<=_s;
+            if(_sc>score_exp)score_exp<=_sc;
+            if({_p,_q,_r,_s}!={board[15],board[11],board[7],board[3]})moved<=1;
+        end
+        endcase
+        for(bi=0;bi<16;bi=bi+1) board[bi]<=nb[bi];
+        state<=ST_WAIT;
+    end
+
+    ST_WAIT: begin
+        if (moved && free_cnt > 0) begin
+            _ridx = lfsr[3:0];
+            if (_ridx >= free_cnt[3:0]) _ridx = _ridx - free_cnt[3:0];
+            if (_ridx >= free_cnt[3:0]) _ridx = 4'd0;
+            spawn_cell  <= free_list[_ridx];
+            spawn_valid <= 1;
+        end else begin
+            spawn_valid <= 0;
+        end
+        state <= ST_SPAWN;
+    end
+
+    ST_SPAWN: begin
+        if (spawn_valid)
+            case (spawn_cell)
+                4'd0: board[0]<=4'd1;  4'd1: board[1]<=4'd1;
+                4'd2: board[2]<=4'd1;  4'd3: board[3]<=4'd1;
+                4'd4: board[4]<=4'd1;  4'd5: board[5]<=4'd1;
+                4'd6: board[6]<=4'd1;  4'd7: board[7]<=4'd1;
+                4'd8: board[8]<=4'd1;  4'd9: board[9]<=4'd1;
+                4'd10:board[10]<=4'd1; 4'd11:board[11]<=4'd1;
+                4'd12:board[12]<=4'd1; 4'd13:board[13]<=4'd1;
+                4'd14:board[14]<=4'd1; default:board[15]<=4'd1;
+            endcase
+        state <= cm ? ST_IDLE : ST_OVER;
+    end
+
+    ST_OVER: begin
+        if(press_c||press_l||press_r||press_u||press_d)
+            begin state<=ST_INIT; init_step<=0; end
+    end
+
+    default: state<=ST_IDLE;
+    endcase
+end
+
+// 9. VGA Renderer
+localparam [9:0] BX=10'd95, BY=10'd15;
+
+wire [9:0] rel_x = hcnt - BX;
+wire [9:0] rel_y = vcnt - BY;
+wire in_bx = (hcnt>=BX)&&(hcnt<BX+440);
+wire in_by = (vcnt>=BY)&&(vcnt<BY+440);
+wire [9:0] sx = rel_x/10'd110;
+wire [9:0] ox = rel_x-(sx*10'd110);
+wire [9:0] sy = rel_y/10'd110;
+wire [9:0] oy = rel_y-(sy*10'd110);
+wire cell_hit = in_bx&&in_by&&(ox>=10'd10)&&(ox<10'd110)
+              &&(oy>=10'd10)&&(oy<10'd110)&&(sx<=10'd3)&&(sy<=10'd3);
+wire [3:0] cell_idx = {sy[1:0],sx[1:0]};
+
+reg [3:0] r_tile_val=0;
+reg       r_cell_hit=0, r_in_board=0, r_vid=0, r_bar_lit=0;
+
+reg [24:0] ov_cnt=0;
+always @(posedge clk)
+    ov_cnt <= (state==ST_OVER) ? ov_cnt+1 : 25'd0;
+wire over_flash = (state==ST_OVER)&&ov_cnt[24];
+
+wire [9:0] bar_w  = {score_exp,3'd0}+{score_exp,5'd0}+{score_exp,1'd0};
+wire       in_bar = (vcnt>=10'd470)&&(vcnt<10'd480);
+
+always @(posedge pclk) begin
+    r_tile_val <= cell_hit ? board[cell_idx] : 4'd0;
+    r_cell_hit <= cell_hit;
+    r_in_board <= in_bx&&in_by;
+    r_vid      <= vid;
+    r_bar_lit  <= in_bar&&(hcnt<bar_w);
+end
+
+reg [11:0] tile_rgb;
+always @(*) begin
+    if (over_flash&&r_cell_hit) tile_rgb=12'hF00;
+    else case(r_tile_val)
+        4'd0:  tile_rgb=12'hCBB;
+        4'd1:  tile_rgb=12'hEDA;
+        4'd2:  tile_rgb=12'hEC8;
+        4'd3:  tile_rgb=12'hF94;
+        4'd4:  tile_rgb=12'hF72;
+        4'd5:  tile_rgb=12'hF54;
+        4'd6:  tile_rgb=12'hF30;
+        4'd7:  tile_rgb=12'hFC5;
+        4'd8:  tile_rgb=12'hFB3;
+        4'd9:  tile_rgb=12'hFA1;
+        4'd10: tile_rgb=12'hF90;
+        4'd11: tile_rgb=12'hFF3;
+        default: tile_rgb=12'hF0F;
+    endcase
+end
+
+wire [11:0] pix =
+    ~r_vid     ? 12'h000 :
+    r_bar_lit  ? 12'h4E5 :
+    r_cell_hit ? tile_rgb :
+    r_in_board ? 12'hA87 :
+                 12'h211;
+
+always @(posedge pclk) {Red,Green,Blue} <= pix;
+
+endmodule
