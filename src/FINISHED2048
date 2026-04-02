@@ -1,0 +1,527 @@
+`timescale 1ns / 1ps
+module top (
+    input  wire       clk,
+    input  wire       BTNC, BTNL, BTNR, BTNU, BTND,
+    output reg        Hsync, Vsync,
+    output reg  [3:0] Red, Green, Blue
+);
+
+//=============================================================================
+// 1. 25 MHz pixel clock
+//=============================================================================
+reg [1:0] clk_div = 2'd0;
+always @(posedge clk) clk_div <= clk_div + 2'd1;
+wire pclk = clk_div[1];
+
+//=============================================================================
+// 2. VGA 640x480 @ 60 Hz
+//=============================================================================
+reg [9:0] hcnt = 10'd0, vcnt = 10'd0;
+always @(posedge pclk) begin
+    if (hcnt == 10'd799) begin
+        hcnt <= 10'd0;
+        vcnt <= (vcnt == 10'd524) ? 10'd0 : vcnt + 10'd1;
+    end else
+        hcnt <= hcnt + 10'd1;
+end
+wire vid = (hcnt < 10'd640) && (vcnt < 10'd480);
+
+always @(posedge pclk) begin
+    Hsync <= ~((hcnt >= 10'd656) && (hcnt < 10'd752));
+    Vsync <= ~((vcnt >= 10'd490) && (vcnt < 10'd492));
+end
+
+//=============================================================================
+// 3. Button debounce (~10 ms @ 100 MHz)
+//=============================================================================
+reg [19:0] deb_cnt  = 20'd0;
+reg        deb_tick = 1'b0;
+always @(posedge clk) begin
+    if (deb_cnt == 20'd999_999) begin
+        deb_cnt <= 20'd0; deb_tick <= 1'b1;
+    end else begin
+        deb_cnt <= deb_cnt + 20'd1; deb_tick <= 1'b0;
+    end
+end
+reg [2:0] sr_c=0,sr_l=0,sr_r=0,sr_u=0,sr_d=0;
+always @(posedge clk) if (deb_tick) begin
+    sr_c<={sr_c[1:0],BTNC}; sr_l<={sr_l[1:0],BTNL};
+    sr_r<={sr_r[1:0],BTNR}; sr_u<={sr_u[1:0],BTNU};
+    sr_d<={sr_d[1:0],BTND};
+end
+wire press_c = (sr_c[2:1]==2'b01);
+wire press_l = (sr_l[2:1]==2'b01);
+wire press_r = (sr_r[2:1]==2'b01);
+wire press_u = (sr_u[2:1]==2'b01);
+wire press_d = (sr_d[2:1]==2'b01);
+
+//=============================================================================
+// 4. LFSR 16-bit free-running
+//=============================================================================
+reg [15:0] lfsr = 16'hACE1;
+wire lfsr_fb = lfsr[15]^lfsr[13]^lfsr[12]^lfsr[10];
+always @(posedge clk) lfsr <= {lfsr[14:0], lfsr_fb};
+
+//=============================================================================
+// 5. Board  board[r*4+c]  0=empty 1=2 2=4 3=8 ... 11=2048
+//=============================================================================
+reg [5:0] board [0:15];
+integer ii;
+initial for (ii=0;ii<16;ii=ii+1) board[ii]=6'd0;
+
+//=============================================================================
+// 6. move_line_left task
+//    compress -> single if/else-if merge -> compress
+//    Only ONE pair merges per line per move (prevents chain in same turn)
+//=============================================================================
+task move_line_left;
+    input  [5:0] a0,a1,a2,a3;
+    output [5:0] b0,b1,b2,b3;
+    output [31:0] add_score;
+    output        moved;
+    reg [5:0] t0,t1,t2,t3;
+    reg [5:0] m0,m1,m2,m3;
+    reg [5:0] p0,p1,p2,p3;
+    integer j;
+    begin
+        add_score=32'd0;
+        t0=6'd0;t1=6'd0;t2=6'd0;t3=6'd0;
+
+        // compress 1
+        j=0;
+        if(a0!=6'd0)begin case(j)0:t0=a0;1:t1=a0;2:t2=a0;default:t3=a0;endcase j=j+1;end
+        if(a1!=6'd0)begin case(j)0:t0=a1;1:t1=a1;2:t2=a1;default:t3=a1;endcase j=j+1;end
+        if(a2!=6'd0)begin case(j)0:t0=a2;1:t1=a2;2:t2=a2;default:t3=a2;endcase j=j+1;end
+        if(a3!=6'd0)begin case(j)0:t0=a3;1:t1=a3;2:t2=a3;default:t3=a3;endcase j=j+1;end
+
+        // merge - if/else-if: only leftmost eligible pair merges
+        m0=t0;m1=t1;m2=t2;m3=t3;
+        if(t0!=6'd0 && t0==t1) begin
+            m0=t0+6'd1;m1=t2;m2=t3;m3=6'd0;
+            add_score=32'd1<<(t0+6'd1);
+        end else if(t1!=6'd0 && t1==t2) begin
+            m1=t1+6'd1;m2=t3;m3=6'd0;
+            add_score=32'd1<<(t1+6'd1);
+        end else if(t2!=6'd0 && t2==t3) begin
+            m2=t2+6'd1;m3=6'd0;
+            add_score=32'd1<<(t2+6'd1);
+        end
+
+        // compress 2
+        p0=6'd0;p1=6'd0;p2=6'd0;p3=6'd0;
+        j=0;
+        if(m0!=6'd0)begin case(j)0:p0=m0;1:p1=m0;2:p2=m0;default:p3=m0;endcase j=j+1;end
+        if(m1!=6'd0)begin case(j)0:p0=m1;1:p1=m1;2:p2=m1;default:p3=m1;endcase j=j+1;end
+        if(m2!=6'd0)begin case(j)0:p0=m2;1:p1=m2;2:p2=m2;default:p3=m2;endcase j=j+1;end
+        if(m3!=6'd0)begin case(j)0:p0=m3;1:p1=m3;2:p2=m3;default:p3=m3;endcase j=j+1;end
+
+        b0=p0;b1=p1;b2=p2;b3=p3;
+        moved=(b0!=a0)||(b1!=a1)||(b2!=a2)||(b3!=a3);
+    end
+endtask
+
+//=============================================================================
+// 7. can-move check (combinatorial)
+//=============================================================================
+reg cm;
+integer cmr,cmc2;
+always @(*) begin : can_move_blk
+    cm=1'b0;
+    for(cmr=0;cmr<4;cmr=cmr+1)
+        for(cmc2=0;cmc2<4;cmc2=cmc2+1) begin
+            if(board[cmr*4+cmc2]==6'd0) cm=1'b1;
+            if(cmc2<3&&board[cmr*4+cmc2]!=6'd0&&
+               board[cmr*4+cmc2]==board[cmr*4+cmc2+1]) cm=1'b1;
+            if(cmr<3&&board[cmr*4+cmc2]!=6'd0&&
+               board[cmr*4+cmc2]==board[(cmr+1)*4+cmc2]) cm=1'b1;
+        end
+end
+
+//=============================================================================
+// 8. Free-cell scan (combinatorial, always sees committed board)
+//=============================================================================
+reg [3:0] free_list [0:15];
+reg [4:0] free_cnt;
+integer fc;
+always @(*) begin : free_scan
+    free_cnt=5'd0;
+    for(fc=0;fc<16;fc=fc+1) begin
+        free_list[fc]=4'd0;
+        if(board[fc]==6'd0) begin
+            free_list[free_cnt]=fc[3:0];
+            free_cnt=free_cnt+5'd1;
+        end
+    end
+end
+
+//=============================================================================
+// 9. Spawn task - picks a random free cell and places a 2 or 4
+//=============================================================================
+reg [3:0] _ridx;
+task do_spawn;
+    begin
+        if(free_cnt>5'd0) begin
+            _ridx=lfsr[3:0];
+            if(_ridx>=free_cnt[3:0]) _ridx=_ridx-free_cnt[3:0];
+            if(_ridx>=free_cnt[3:0]) _ridx=_ridx-free_cnt[3:0];
+            if(_ridx>=free_cnt[3:0]) _ridx=4'd0;
+            case(free_list[_ridx])
+                4'd0:  board[0] <=(lfsr[7]?6'd2:6'd1);
+                4'd1:  board[1] <=(lfsr[7]?6'd2:6'd1);
+                4'd2:  board[2] <=(lfsr[7]?6'd2:6'd1);
+                4'd3:  board[3] <=(lfsr[7]?6'd2:6'd1);
+                4'd4:  board[4] <=(lfsr[7]?6'd2:6'd1);
+                4'd5:  board[5] <=(lfsr[7]?6'd2:6'd1);
+                4'd6:  board[6] <=(lfsr[7]?6'd2:6'd1);
+                4'd7:  board[7] <=(lfsr[7]?6'd2:6'd1);
+                4'd8:  board[8] <=(lfsr[7]?6'd2:6'd1);
+                4'd9:  board[9] <=(lfsr[7]?6'd2:6'd1);
+                4'd10: board[10]<=(lfsr[7]?6'd2:6'd1);
+                4'd11: board[11]<=(lfsr[7]?6'd2:6'd1);
+                4'd12: board[12]<=(lfsr[7]?6'd2:6'd1);
+                4'd13: board[13]<=(lfsr[7]?6'd2:6'd1);
+                4'd14: board[14]<=(lfsr[7]?6'd2:6'd1);
+                default: board[15]<=(lfsr[7]?6'd2:6'd1);
+            endcase
+        end
+    end
+endtask
+
+//=============================================================================
+// 10. Main FSM
+//     0=IDLE  1=SETTLE  2=SPAWN  3=DELAY
+//     New-game path: clear → SETTLE → SPAWN(tile1) → SETTLE → SPAWN(tile2) → IDLE
+//     Move path:     slide  → SETTLE → SPAWN → DELAY(~0.67s) → IDLE
+//=============================================================================
+reg [5:0] board_next [0:15];
+reg [5:0] b0n,b1n,b2n,b3n;
+reg [31:0] line_score;
+reg        line_moved, any_moved;
+reg [31:0] score        = 32'd0;
+reg [31:0] add_score_total;
+reg        game_over    = 1'b0;
+reg [2:0]  state        = 3'd0;
+reg [1:0]  init_spawns  = 2'd0;
+
+// ~0.67 s at 100 MHz (change 26→25 for 0.33 s, 26→27 for 1.34 s)
+localparam DELAY_BITS = 26;
+reg [DELAY_BITS-1:0] delay_cnt = 0;
+
+integer r,c,i;
+
+always @(posedge clk) begin : fsm
+    case(state)
+
+    //------------------------------------------------------------------
+    3'd0: begin // IDLE - accept input
+        if(press_c) begin
+            for(i=0;i<16;i=i+1) board[i]<=6'd0;
+            score       <= 32'd0;
+            game_over   <= 1'b0;
+            init_spawns <= 2'd0;
+            state       <= 3'd1;   // settle then spawn 2 start tiles
+        end
+        else if(!game_over && (press_l||press_r||press_u||press_d)) begin
+            for(i=0;i<16;i=i+1) board_next[i]=board[i];
+            any_moved       = 1'b0;
+            add_score_total = 32'd0;
+
+            if(press_l) begin
+                for(r=0;r<4;r=r+1) begin
+                    move_line_left(board[r*4+0],board[r*4+1],
+                                   board[r*4+2],board[r*4+3],
+                                   b0n,b1n,b2n,b3n,line_score,line_moved);
+                    board_next[r*4+0]=b0n;board_next[r*4+1]=b1n;
+                    board_next[r*4+2]=b2n;board_next[r*4+3]=b3n;
+                    if(line_moved) any_moved=1'b1;
+                    add_score_total=add_score_total+line_score;
+                end
+            end
+            else if(press_r) begin
+                for(r=0;r<4;r=r+1) begin
+                    move_line_left(board[r*4+3],board[r*4+2],
+                                   board[r*4+1],board[r*4+0],
+                                   b0n,b1n,b2n,b3n,line_score,line_moved);
+                    board_next[r*4+3]=b0n;board_next[r*4+2]=b1n;
+                    board_next[r*4+1]=b2n;board_next[r*4+0]=b3n;
+                    if(line_moved) any_moved=1'b1;
+                    add_score_total=add_score_total+line_score;
+                end
+            end
+            else if(press_u) begin
+                for(c=0;c<4;c=c+1) begin
+                    move_line_left(board[0*4+c],board[1*4+c],
+                                   board[2*4+c],board[3*4+c],
+                                   b0n,b1n,b2n,b3n,line_score,line_moved);
+                    board_next[0*4+c]=b0n;board_next[1*4+c]=b1n;
+                    board_next[2*4+c]=b2n;board_next[3*4+c]=b3n;
+                    if(line_moved) any_moved=1'b1;
+                    add_score_total=add_score_total+line_score;
+                end
+            end
+            else if(press_d) begin
+                for(c=0;c<4;c=c+1) begin
+                    move_line_left(board[3*4+c],board[2*4+c],
+                                   board[1*4+c],board[0*4+c],
+                                   b0n,b1n,b2n,b3n,line_score,line_moved);
+                    board_next[3*4+c]=b0n;board_next[2*4+c]=b1n;
+                    board_next[1*4+c]=b2n;board_next[0*4+c]=b3n;
+                    if(line_moved) any_moved=1'b1;
+                    add_score_total=add_score_total+line_score;
+                end
+            end
+
+            if(any_moved) begin
+                for(i=0;i<16;i=i+1) board[i]<=board_next[i];
+                score <= score+add_score_total;
+                state <= 3'd1;
+            end
+        end
+    end
+
+    //------------------------------------------------------------------
+    3'd1: begin // SETTLE - one clock for free_scan to see new board
+        state <= 3'd2;
+    end
+
+    //------------------------------------------------------------------
+    3'd2: begin // SPAWN - place tile, visible on screen immediately
+        do_spawn;
+        if(init_spawns==2'd0) begin
+            // first start tile placed; go back for second
+            init_spawns <= 2'd1;
+            state       <= 3'd1;
+        end
+        else begin
+            // normal move spawn: start delay so player can see new tile
+            delay_cnt <= 0;
+            state     <= 3'd3;
+        end
+    end
+
+    //------------------------------------------------------------------
+    3'd3: begin // DELAY - tile visible, inputs locked for ~0.67 s
+        if(delay_cnt == {DELAY_BITS{1'b1}}) begin
+            game_over <= ~cm;
+            state     <= 3'd0;
+        end else
+            delay_cnt <= delay_cnt + 1;
+    end
+
+    default: state <= 3'd0;
+    endcase
+end
+
+//=============================================================================
+// 11. VGA layout
+//     Board 440x440 at (100,20). Slot = 110px (10px gap + 100px tile).
+//=============================================================================
+localparam [9:0] BX=10'd100, BY=10'd20;
+
+wire in_board = (hcnt>=BX)&&(hcnt<BX+440)&&(vcnt>=BY)&&(vcnt<BY+440);
+wire [9:0] bx_off = hcnt-BX;
+wire [9:0] by_off = vcnt-BY;
+wire [1:0] tile_col = bx_off/10'd110;
+wire [1:0] tile_row = by_off/10'd110;
+wire [9:0] cx = bx_off % 10'd110;
+wire [9:0] cy = by_off % 10'd110;
+wire in_cell = in_board && (cx>=10'd10) && (cy>=10'd10);
+wire [6:0] lx = cx[6:0] - 7'd10;   // cell-local 0..99
+wire [6:0] ly = cy[6:0] - 7'd10;
+wire [3:0] tidx = {tile_row,tile_col};
+wire [5:0] tval = board[tidx];
+
+//=============================================================================
+// 12. Tile colours
+//=============================================================================
+function [11:0] tile_color;
+    input [5:0] e;
+    begin
+        case(e)
+            6'd0:  tile_color=12'hAAA; // empty  - grey
+            6'd1:  tile_color=12'hFFE; // 2      - cream
+            6'd2:  tile_color=12'hFD9; // 4      - yellow
+            6'd3:  tile_color=12'hFA5; // 8      - orange
+            6'd4:  tile_color=12'hF62; // 16     - red-orange
+            6'd5:  tile_color=12'hF25; // 32     - hot red
+            6'd6:  tile_color=12'hC0F; // 64     - magenta
+            6'd7:  tile_color=12'h94F; // 128    - purple
+            6'd8:  tile_color=12'h44F; // 256    - deep blue
+            6'd9:  tile_color=12'h08F; // 512    - sky blue
+            6'd10: tile_color=12'h0D8; // 1024   - teal
+            6'd11: tile_color=12'h0F4; // 2048   - green
+            default: tile_color=12'hFF0; // >2048 - gold
+        endcase
+    end
+endfunction
+
+wire [11:0] cell_rgb = tile_color(tval);
+
+//=============================================================================
+// 13. 3x5 dot-matrix font  (15 bits: row0..row4 each 3 bits, bit14=r0c0)
+//=============================================================================
+function [14:0] digit_pat;
+    input [3:0] d;
+    begin
+        case(d)
+            4'd0: digit_pat=15'b111_101_101_101_111;
+            4'd1: digit_pat=15'b010_010_010_010_010;
+            4'd2: digit_pat=15'b111_001_111_100_111;
+            4'd3: digit_pat=15'b111_001_111_001_111;
+            4'd4: digit_pat=15'b101_101_111_001_001;
+            4'd5: digit_pat=15'b111_100_111_001_111;
+            4'd6: digit_pat=15'b111_100_111_101_111;
+            4'd7: digit_pat=15'b111_001_001_001_001;
+            4'd8: digit_pat=15'b111_101_111_101_111;
+            4'd9: digit_pat=15'b111_101_111_001_111;
+            default: digit_pat=15'd0;
+        endcase
+    end
+endfunction
+
+//=============================================================================
+// 14. exp -> 4 packed decimal nibbles  (4'hF = blank/leading zero)
+//=============================================================================
+function [15:0] exp_to_digits;
+    input [5:0] e;
+    begin
+        case(e)
+            6'd0:  exp_to_digits=16'hFFFF; // empty
+            6'd1:  exp_to_digits=16'hFFF2; // 2
+            6'd2:  exp_to_digits=16'hFFF4; // 4
+            6'd3:  exp_to_digits=16'hFFF8; // 8
+            6'd4:  exp_to_digits=16'hFF16; // 16
+            6'd5:  exp_to_digits=16'hFF32; // 32
+            6'd6:  exp_to_digits=16'hFF64; // 64
+            6'd7:  exp_to_digits=16'hF128; // 128
+            6'd8:  exp_to_digits=16'hF256; // 256
+            6'd9:  exp_to_digits=16'hF512; // 512
+            6'd10: exp_to_digits=16'h1024; // 1024
+            6'd11: exp_to_digits=16'h2048; // 2048
+            default: exp_to_digits=16'hFFFF;
+        endcase
+    end
+endfunction
+
+//=============================================================================
+// 15. Number renderer  (combinatorial from hcnt/vcnt)
+//     Font dot = 7x7 px block. Up to 4 digits, centred in 100px tile.
+//     PX=7  SP=4  FONT_W=21  STRIDE=25  FONT_H=35  TOP_MARGIN=55
+//=============================================================================
+localparam integer PX=7, SP=4, FONT_W=21, STRIDE=25, FONT_H=35, TOP_M=55;
+
+reg tile_num_on;
+always @(*) begin : num_render
+    reg [15:0] digs;
+    integer ndig,gw,x0dig,dx,dy,di,dc,dr,bidx;
+    reg [3:0] d;
+    reg [14:0] pat;
+    tile_num_on=1'b0;
+    if(in_cell && tval!=6'd0) begin
+        digs=exp_to_digits(tval);
+        if      (digs[15:12]!=4'hF) ndig=4;
+        else if (digs[11:8] !=4'hF) ndig=3;
+        else if (digs[7:4]  !=4'hF) ndig=2;
+        else                        ndig=1;
+        gw    = ndig*STRIDE - SP;
+        x0dig = (100 - gw) / 2;
+        if(ly>=TOP_M && ly<TOP_M+FONT_H && lx>=x0dig && lx<x0dig+gw) begin
+            dx=lx-x0dig; dy=ly-TOP_M;
+            di=dx/STRIDE;
+            dc=(dx%STRIDE)/PX;
+            dr=dy/PX;
+            if((dx%STRIDE)<FONT_W && di<ndig) begin
+                case(ndig-di)
+                    4: d=digs[15:12];
+                    3: d=digs[11:8];
+                    2: d=digs[7:4];
+                    default: d=digs[3:0];
+                endcase
+                pat=digit_pat(d);
+                bidx=dr*3+dc;
+                if(dr<5 && dc<3 && pat[14-bidx]) tile_num_on=1'b1;
+            end
+        end
+    end
+end
+
+//=============================================================================
+// 16. Score display - top-right, 6 digits, PX=5 blocks
+//=============================================================================
+localparam [9:0] SC_X0=10'd490, SC_Y0=10'd4;
+localparam integer SC_PX=5, SC_DW=15, SC_STRIDE=18, SC_H=25;
+
+wire in_score = (hcnt>=SC_X0)&&(hcnt<SC_X0+6*SC_STRIDE)&&
+                (vcnt>=SC_Y0)&&(vcnt<SC_Y0+SC_H);
+wire [9:0] sc_rx = hcnt-SC_X0;
+wire [9:0] sc_ry = vcnt-SC_Y0;
+
+function [23:0] score_digits;
+    input [31:0] s;
+    reg [31:0] v;
+    begin
+        v=s;
+        score_digits[3:0]  =v%10; v=v/10;
+        score_digits[7:4]  =v%10; v=v/10;
+        score_digits[11:8] =v%10; v=v/10;
+        score_digits[15:12]=v%10; v=v/10;
+        score_digits[19:16]=v%10; v=v/10;
+        score_digits[23:20]=v%10;
+    end
+endfunction
+
+reg score_on;
+always @(*) begin : score_render
+    reg [23:0] sd;
+    integer si,sc2,sr2,b2;
+    reg [3:0] sdig;
+    reg [14:0] spat;
+    score_on=1'b0;
+    if(in_score) begin
+        sd=score_digits(score);
+        si=sc_rx/SC_STRIDE;
+        sc2=(sc_rx%SC_STRIDE)/SC_PX;
+        sr2=sc_ry/SC_PX;
+        if((sc_rx%SC_STRIDE)<SC_DW && si<6 && sr2<5 && sc2<3) begin
+            case(5-si)
+                5: sdig=sd[23:20]; 4: sdig=sd[19:16];
+                3: sdig=sd[15:12]; 2: sdig=sd[11:8];
+                1: sdig=sd[7:4];   default: sdig=sd[3:0];
+            endcase
+            spat=digit_pat(sdig);
+            b2=sr2*3+sc2;
+            if(spat[14-b2]) score_on=1'b1;
+        end
+    end
+end
+
+//=============================================================================
+// 17. Game-over flash  (bit 24 → ~0.17 s period)
+//=============================================================================
+reg [24:0] ov_cnt=25'd0;
+always @(posedge clk)
+    ov_cnt <= game_over ? ov_cnt+25'd1 : 25'd0;
+wire over_flash = game_over && ov_cnt[24];
+
+//=============================================================================
+// 18. Pixel mux
+//=============================================================================
+always @(posedge pclk) begin
+    if(!vid)
+        {Red,Green,Blue} <= 12'h000;
+    else begin
+        {Red,Green,Blue} <= 12'h322;                         // bg
+        if(in_score)     {Red,Green,Blue} <= 12'h444;        // score bg
+        if(score_on)     {Red,Green,Blue} <= 12'hFFF;        // score digits
+        if(in_board)     {Red,Green,Blue} <= 12'h555;        // grid
+        if(in_cell)      {Red,Green,Blue} <= over_flash ? 12'hF00 : cell_rgb;
+        if(tile_num_on) begin
+            case(tval)
+                6'd1,6'd2,6'd3: {Red,Green,Blue} <= 12'h333; // dark on light tile
+                default:        {Red,Green,Blue} <= 12'hFFF; // white on dark tile
+            endcase
+        end
+    end
+end
+
+endmodule
