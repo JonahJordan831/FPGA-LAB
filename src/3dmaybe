@@ -1,0 +1,611 @@
+`timescale 1ns / 1ps
+`default_nettype none
+//==============================================================================
+// raycaster_top.v  —  All-in-one Wolfenstein-style raycaster
+// Basys3 100MHz,  VGA 640x480 @ 60Hz,  320x240 internal doubled to 640x480
+// Controls:  BTNU=fwd  BTND=back  BTNL=turn left  BTNR=turn right  BTNC=reset
+//==============================================================================
+
+//==============================================================================
+// RayCaster module
+//==============================================================================
+module RayCaster (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [8:0]  cam_x,
+
+    input  wire signed [15:0] pos_x,
+    input  wire signed [15:0] pos_y,
+    input  wire signed [15:0] dir_x,
+    input  wire signed [15:0] dir_y,
+    input  wire signed [15:0] plane_x,
+    input  wire signed [15:0] plane_y,
+
+    input  wire [1023:0] map_flat,
+
+    input  wire        start,
+    output reg         busy,
+    output reg         done,
+
+    output wire [7:0]  line_height,
+    output wire [3:0]  line_color
+);
+
+wire [3:0] map_data [0:255];
+genvar gmi;
+generate
+    for (gmi = 0; gmi < 256; gmi = gmi + 1)
+        assign map_data[gmi] = map_flat[gmi*4 +: 4];
+endgenerate
+
+function signed [15:0] trunc_mul;
+    input signed [31:0] m;
+    begin trunc_mul = m[23:8]; end
+endfunction
+
+reg [15:0] recip [1:255];
+integer ri;
+initial begin
+    for (ri = 1; ri < 256; ri = ri + 1)
+        recip[ri] = 32768 / ri;
+end
+
+localparam [3:0]
+    IDLE         = 4'd0,
+    MULTIPLY     = 4'd1,
+    RAY_CALC     = 4'd2,
+    RAY_CALC_X   = 4'd3,
+    RAY_CALC_Y   = 4'd4,
+    DELTADIST    = 4'd5,
+    START_CAST   = 4'd6,
+    DDA_FIND_HIT = 4'd7,
+    CALC_DIST    = 4'd8,
+    FIND_HEIGHT  = 4'd9,
+    DONE_STATE   = 4'd10;
+
+reg [3:0] state_q = IDLE, state_d;
+reg [3:0] next_state_q = IDLE, next_state_d;
+
+reg signed [15:0] raydir_x_q,    raydir_x_d;
+reg signed [15:0] raydir_y_q,    raydir_y_d;
+reg signed [15:0] delta_n_x_q,   delta_n_x_d;
+reg signed [15:0] delta_n_y_q,   delta_n_y_d;
+reg        [15:0] delta_x_q,     delta_x_d;
+reg        [15:0] delta_y_q,     delta_y_d;
+reg        [15:0] side_dist_x_q, side_dist_x_d;
+reg        [15:0] side_dist_y_q, side_dist_y_d;
+reg signed [15:0] step_x_q,      step_x_d;
+reg signed [15:0] step_y_q,      step_y_d;
+reg        [15:0] sidestep_x_q,  sidestep_x_d;
+reg        [15:0] sidestep_y_q,  sidestep_y_d;
+reg        [15:0] map_x_q,       map_x_d;
+reg        [15:0] map_y_q,       map_y_d;
+reg               side_q,        side_d;
+reg signed [15:0] p_wall_dist_q, p_wall_dist_d;
+reg signed [15:0] mul_arg1_q,    mul_arg1_d;
+reg signed [15:0] mul_arg2_q,    mul_arg2_d;
+reg signed [15:0] mul_res_q,     mul_res_d;
+reg signed [15:0] camerax_q,     camerax_d;
+reg        [3:0]  color_q,       color_d;
+reg        [7:0]  lh_q,          lh_d;
+reg        [5:0]  dda_iter_q,    dda_iter_d;
+
+localparam signed [15:0] ONE_Q214    = 16'sh4000;
+localparam signed [15:0] NEG_ONE_Q88 = 16'shFF00;
+localparam signed [15:0] POS_ONE_Q88 = 16'sh0100;
+
+always @(*) begin
+    state_d       = state_q;       next_state_d  = next_state_q;
+    raydir_x_d    = raydir_x_q;    raydir_y_d    = raydir_y_q;
+    delta_n_x_d   = delta_n_x_q;   delta_n_y_d   = delta_n_y_q;
+    delta_x_d     = delta_x_q;     delta_y_d     = delta_y_q;
+    side_dist_x_d = side_dist_x_q; side_dist_y_d = side_dist_y_q;
+    step_x_d      = step_x_q;      step_y_d      = step_y_q;
+    sidestep_x_d  = sidestep_x_q;  sidestep_y_d  = sidestep_y_q;
+    map_x_d       = map_x_q;       map_y_d       = map_y_q;
+    side_d        = side_q;
+    p_wall_dist_d = p_wall_dist_q;
+    mul_arg1_d    = mul_arg1_q;     mul_arg2_d    = mul_arg2_q;
+    mul_res_d     = mul_res_q;
+    camerax_d     = camerax_q;
+    color_d       = color_q;
+    lh_d          = lh_q;
+    dda_iter_d    = dda_iter_q;
+    busy          = 1'b1;
+    done          = 1'b0;
+
+    case (state_q)
+    IDLE: begin
+        busy = 1'b0;
+        if (start) begin
+            camerax_d  = ($signed({7'd0, cam_x}) * $signed(16'sh0066)) - ONE_Q214;
+            dda_iter_d = 6'd0;
+            state_d    = RAY_CALC;
+        end
+    end
+    MULTIPLY: begin
+        mul_res_d = trunc_mul($signed(mul_arg1_q) * $signed(mul_arg2_q));
+        state_d   = next_state_q;
+    end
+    RAY_CALC: begin
+        mul_arg1_d = plane_x; mul_arg2_d = camerax_q;
+        next_state_d = RAY_CALC_X; state_d = MULTIPLY;
+    end
+    RAY_CALC_X: begin
+        raydir_x_d = dir_x + mul_res_q;
+        mul_arg1_d = plane_y; next_state_d = RAY_CALC_Y; state_d = MULTIPLY;
+    end
+    RAY_CALC_Y: begin
+        raydir_y_d = dir_y + mul_res_q; state_d = DELTADIST;
+    end
+    DELTADIST: begin : dd_block
+        reg [15:0] abs_rdx, abs_rdy; reg [7:0] ax, ay;
+        abs_rdx = raydir_x_q[15] ? (16'd0-raydir_x_q) : raydir_x_q;
+        abs_rdy = raydir_y_q[15] ? (16'd0-raydir_y_q) : raydir_y_q;
+        ax = abs_rdx[15:8]; ay = abs_rdy[15:8];
+        if (ax==8'd0) begin delta_x_d=16'h7FFF; delta_n_x_d=16'sh7FFF; end
+        else begin delta_x_d=recip[ax];
+            delta_n_x_d=raydir_x_q[15]?-$signed({1'b0,recip[ax]}):$signed({1'b0,recip[ax]}); end
+        if (ay==8'd0) begin delta_y_d=16'h7FFF; delta_n_y_d=16'sh7FFF; end
+        else begin delta_y_d=recip[ay];
+            delta_n_y_d=raydir_y_q[15]?-$signed({1'b0,recip[ay]}):$signed({1'b0,recip[ay]}); end
+        state_d = START_CAST;
+    end
+    START_CAST: begin : sc_block
+        reg [31:0] sdx_mul, sdy_mul;
+        if (raydir_x_q[15]) begin step_x_d=NEG_ONE_Q88; sidestep_x_d=16'h0100; end
+        else                begin step_x_d=POS_ONE_Q88; sidestep_x_d=16'h0000; end
+        if (raydir_y_q[15]) begin step_y_d=NEG_ONE_Q88; sidestep_y_d=16'h0100; end
+        else                begin step_y_d=POS_ONE_Q88; sidestep_y_d=16'h0000; end
+        map_x_d = pos_x & 16'hFF00;
+        map_y_d = pos_y & 16'hFF00;
+        sdx_mul = raydir_x_q[15] ?
+            ({8'd0, pos_x[7:0], 8'd0}*{16'd0,delta_x_q}) :
+            ({8'd0,~pos_x[7:0], 8'd0}*{16'd0,delta_x_q});
+        sdy_mul = raydir_y_q[15] ?
+            ({8'd0, pos_y[7:0], 8'd0}*{16'd0,delta_y_q}) :
+            ({8'd0,~pos_y[7:0], 8'd0}*{16'd0,delta_y_q});
+        side_dist_x_d = sdx_mul[23:8];
+        side_dist_y_d = sdy_mul[23:8];
+        dda_iter_d = 6'd0; state_d = DDA_FIND_HIT;
+    end
+    DDA_FIND_HIT: begin : dda_block
+        reg [3:0] mcx, mcy, hit; reg [15:0] mx_next, my_next;
+        if (side_dist_x_q < side_dist_y_q) begin
+            side_dist_x_d=side_dist_x_q+delta_x_q; mx_next=map_x_q+step_x_q; my_next=map_y_q; side_d=1'b0;
+        end else begin
+            side_dist_y_d=side_dist_y_q+delta_y_q; mx_next=map_x_q; my_next=map_y_q+step_y_q; side_d=1'b1;
+        end
+        map_x_d=mx_next; map_y_d=my_next;
+        mcx=mx_next[11:8]; mcy=my_next[11:8];
+        if (mcx>4'd15 || mcy>4'd15) begin color_d=4'd0; lh_d=8'd0; state_d=DONE_STATE; end
+        else begin
+            hit=map_data[{mcy,mcx}]; dda_iter_d=dda_iter_q+6'd1;
+            if      (hit!=4'd0)           begin color_d={side_d,hit[2:0]}; dda_iter_d=6'd0; state_d=CALC_DIST; end
+            else if (dda_iter_q>=6'd62)   begin color_d=4'd0; lh_d=8'd0; dda_iter_d=6'd0; state_d=DONE_STATE; end
+        end
+    end
+    CALC_DIST: begin
+        mul_arg1_d = side_q ? ($signed(map_y_q)-$signed(pos_y)+$signed(sidestep_y_q))
+                            : ($signed(map_x_q)-$signed(pos_x)+$signed(sidestep_x_q));
+        mul_arg2_d = side_q ? delta_n_y_q : delta_n_x_q;
+        next_state_d=FIND_HEIGHT; state_d=MULTIPLY;
+    end
+    FIND_HEIGHT: begin : fh_block
+        reg [7:0] dist_int, hh; reg [15:0] rv;
+        p_wall_dist_d=mul_res_q; dist_int=mul_res_q[15:8];
+        if (dist_int==8'd0) hh=8'd240;
+        else begin rv=recip[dist_int]; hh=rv[15:7]; if(hh>8'd240) hh=8'd240; end
+        lh_d=hh; state_d=DONE_STATE;
+    end
+    DONE_STATE: begin
+        done=1'b1; busy=1'b0;
+        if (!start) state_d=IDLE;
+    end
+    default: state_d=IDLE;
+    endcase
+end
+
+always @(posedge clk) begin
+    if (rst) begin
+        state_q<=IDLE; next_state_q<=IDLE;
+        raydir_x_q<=0; raydir_y_q<=0; delta_n_x_q<=0; delta_n_y_q<=0;
+        delta_x_q<=0; delta_y_q<=0; side_dist_x_q<=0; side_dist_y_q<=0;
+        step_x_q<=0; step_y_q<=0; sidestep_x_q<=0; sidestep_y_q<=0;
+        map_x_q<=0; map_y_q<=0; side_q<=0; p_wall_dist_q<=0;
+        mul_arg1_q<=0; mul_arg2_q<=0; mul_res_q<=0; camerax_q<=0;
+        color_q<=0; lh_q<=0; dda_iter_q<=0;
+    end else begin
+        state_q<=state_d; next_state_q<=next_state_d;
+        raydir_x_q<=raydir_x_d; raydir_y_q<=raydir_y_d;
+        delta_n_x_q<=delta_n_x_d; delta_n_y_q<=delta_n_y_d;
+        delta_x_q<=delta_x_d; delta_y_q<=delta_y_d;
+        side_dist_x_q<=side_dist_x_d; side_dist_y_q<=side_dist_y_d;
+        step_x_q<=step_x_d; step_y_q<=step_y_d;
+        sidestep_x_q<=sidestep_x_d; sidestep_y_q<=sidestep_y_d;
+        map_x_q<=map_x_d; map_y_q<=map_y_d; side_q<=side_d;
+        p_wall_dist_q<=p_wall_dist_d;
+        mul_arg1_q<=mul_arg1_d; mul_arg2_q<=mul_arg2_d; mul_res_q<=mul_res_d;
+        camerax_q<=camerax_d; color_q<=color_d; lh_q<=lh_d; dda_iter_q<=dda_iter_d;
+    end
+end
+
+assign line_height = lh_q;
+assign line_color  = color_q;
+endmodule
+
+
+//==============================================================================
+// xpm_sdpram_wrap — thin wrapper around xpm_memory_sdpram
+// 320 entries x 20 bits, Simple Dual Port (write A / read B), common clock
+//==============================================================================
+module xpm_sdpram_wrap (
+    input  wire        clk,
+    input  wire        we,
+    input  wire [8:0]  waddr,   // 0-319
+    input  wire [19:0] wdata,
+    input  wire [8:0]  raddr,
+    output wire [19:0] rdata
+);
+    xpm_memory_sdpram #(
+        .ADDR_WIDTH_A        (9),
+        .ADDR_WIDTH_B        (9),
+        .BYTE_WRITE_WIDTH_A  (20),
+        .CLOCKING_MODE       ("common_clock"),
+        .ECC_MODE            ("no_ecc"),
+        .MEMORY_PRIMITIVE    ("block"),
+        .MEMORY_SIZE         (320*20),   // 6400 bits
+        .READ_DATA_WIDTH_B   (20),
+        .READ_LATENCY_B      (1),
+        .WRITE_DATA_WIDTH_A  (20),
+        .WRITE_MODE_B        ("no_change"),
+        .AUTO_SLEEP_TIME     (0),
+        .CASCADE_HEIGHT      (0),
+        .MEMORY_INIT_FILE    ("none"),
+        .MEMORY_INIT_PARAM   ("0"),
+        .MEMORY_OPTIMIZATION ("true"),
+        .MESSAGE_CONTROL     (0),
+        .RST_MODE_A          ("SYNC"),
+        .RST_MODE_B          ("SYNC"),
+        .SIM_ASSERT_CHK      (0),
+        .USE_EMBEDDED_CONSTRAINT(0),
+        .USE_MEM_INIT        (0),
+        .WAKEUP_TIME         ("disable_sleep")
+    ) u_mem (
+        .clka   (clk),   .clkb   (clk),
+        .ena    (we),    .enb    (1'b1),
+        .wea    (1'b1),
+        .addra  (waddr), .addrb  (raddr),
+        .dina   (wdata), .doutb  (rdata),
+        .rstb   (1'b0),  .regceb (1'b1),
+        .sleep  (1'b0),
+        .injectdbiterra(1'b0), .injectsbiterra(1'b0),
+        .dbiterrb(), .sbiterrb()
+    );
+endmodule
+
+
+//==============================================================================
+// Top module
+//==============================================================================
+module top (
+    input  wire        CLK,
+    input  wire        BTNC, BTNL, BTNR, BTNU, BTND,
+    output wire        VGA_HS_O,
+    output wire        VGA_VS_O,
+    output wire [3:0]  VGA_R,
+    output wire [3:0]  VGA_G,
+    output wire [3:0]  VGA_B
+);
+
+// ─── Reset ────────────────────────────────────────────────────────────────────
+reg [3:0] rst_sr = 4'b1111;
+wire rst = rst_sr[0];
+always @(posedge CLK) rst_sr <= {1'b0, rst_sr[3:1]};
+
+// ─── 25 MHz pixel strobe ──────────────────────────────────────────────────────
+reg [1:0] clk_div = 2'd0;
+wire pix_stb = (clk_div == 2'd0);
+always @(posedge CLK) clk_div <= clk_div + 2'd1;
+
+// ─── VGA timing ───────────────────────────────────────────────────────────────
+reg [9:0] hcnt = 10'd0, vcnt = 10'd0;
+always @(posedge CLK) begin
+    if (pix_stb) begin
+        if (hcnt == 10'd799) begin
+            hcnt <= 10'd0;
+            vcnt <= (vcnt == 10'd524) ? 10'd0 : vcnt + 10'd1;
+        end else hcnt <= hcnt + 10'd1;
+    end
+end
+
+wire video_on    = (hcnt < 10'd640) && (vcnt < 10'd480);
+wire vblank      = (vcnt >= 10'd480);
+reg  vblank_r    = 1'b0;
+always @(posedge CLK) vblank_r <= vblank;
+wire frame_start = vblank && !vblank_r;
+
+reg hs_r=1'b1, vs_r=1'b1;
+always @(posedge CLK) begin
+    hs_r <= ~((hcnt>=10'd656)&&(hcnt<10'd752));
+    vs_r <= ~((vcnt>=10'd490)&&(vcnt<10'd492));
+end
+assign VGA_HS_O = hs_r;
+assign VGA_VS_O = vs_r;
+
+// ─── Button debounce ──────────────────────────────────────────────────────────
+reg [1:0] sl=0,sr=0,su=0,sd=0,sc_s=0;
+always @(posedge CLK) begin
+    sl<={sl[0],BTNL}; sr<={sr[0],BTNR};
+    su<={su[0],BTNU}; sd<={sd[0],BTND}; sc_s<={sc_s[0],BTNC};
+end
+reg [19:0] dcl=0,dcr=0,dcu=0,dcd=0,dcc=0;
+reg btn_l=0,btn_r=0,btn_u=0,btn_d=0,btn_c=0;
+always @(posedge CLK) begin
+    if(sl[1]==btn_l)   dcl<=0; else begin dcl<=dcl+1; if(&dcl) btn_l<=sl[1];   end
+    if(sr[1]==btn_r)   dcr<=0; else begin dcr<=dcr+1; if(&dcr) btn_r<=sr[1];   end
+    if(su[1]==btn_u)   dcu<=0; else begin dcu<=dcu+1; if(&dcu) btn_u<=su[1];   end
+    if(sd[1]==btn_d)   dcd<=0; else begin dcd<=dcd+1; if(&dcd) btn_d<=sd[1];   end
+    if(sc_s[1]==btn_c) dcc<=0; else begin dcc<=dcc+1; if(&dcc) btn_c<=sc_s[1]; end
+end
+
+// ─── Angle LUT (64 steps, Q2.14) ──────────────────────────────────────────────
+reg signed [15:0] angle_table [0:63][0:3];
+initial begin
+    angle_table[ 0][0]=16'sh4000; angle_table[ 0][1]=16'sh0000; angle_table[ 0][2]=16'sh0000; angle_table[ 0][3]=16'sh2A66;
+    angle_table[ 1][0]=16'sh3FF6; angle_table[ 1][1]=16'sh023C; angle_table[ 1][2]=16'shFE84; angle_table[ 1][3]=16'sh2A50;
+    angle_table[ 2][0]=16'sh3FD9; angle_table[ 2][1]=16'sh0478; angle_table[ 2][2]=16'shFD09; angle_table[ 2][3]=16'sh2A05;
+    angle_table[ 3][0]=16'sh3FA9; angle_table[ 3][1]=16'sh06B3; angle_table[ 3][2]=16'shFB90; angle_table[ 3][3]=16'sh2986;
+    angle_table[ 4][0]=16'sh3F67; angle_table[ 4][1]=16'sh08E8; angle_table[ 4][2]=16'shFA1A; angle_table[ 4][3]=16'sh28D3;
+    angle_table[ 5][0]=16'sh3F0D; angle_table[ 5][1]=16'sh0B19; angle_table[ 5][2]=16'shF8A6; angle_table[ 5][3]=16'sh27EE;
+    angle_table[ 6][0]=16'sh3EA2; angle_table[ 6][1]=16'sh0D44; angle_table[ 6][2]=16'shF736; angle_table[ 6][3]=16'sh26D8;
+    angle_table[ 7][0]=16'sh3E26; angle_table[ 7][1]=16'sh0F68; angle_table[ 7][2]=16'shF5CA; angle_table[ 7][3]=16'sh2592;
+    angle_table[ 8][0]=16'sh3D9B; angle_table[ 8][1]=16'sh1187; angle_table[ 8][2]=16'shF462; angle_table[ 8][3]=16'sh2424;
+    angle_table[ 9][0]=16'sh3CF7; angle_table[ 9][1]=16'sh139F; angle_table[ 9][2]=16'shF2FF; angle_table[ 9][3]=16'sh2290;
+    angle_table[10][0]=16'sh3C42; angle_table[10][1]=16'sh15AE; angle_table[10][2]=16'shF1A0; angle_table[10][3]=16'sh20D8;
+    angle_table[11][0]=16'sh3B78; angle_table[11][1]=16'sh17B5; angle_table[11][2]=16'shF046; angle_table[11][3]=16'sh1EFD;
+    angle_table[12][0]=16'sh3A9D; angle_table[12][1]=16'sh19B3; angle_table[12][2]=16'shEEF2; angle_table[12][3]=16'sh1D02;
+    angle_table[13][0]=16'sh39B3; angle_table[13][1]=16'sh1BA8; angle_table[13][2]=16'shEDA5; angle_table[13][3]=16'sh1AE8;
+    angle_table[14][0]=16'sh38B3; angle_table[14][1]=16'sh1D93; angle_table[14][2]=16'shEC5E; angle_table[14][3]=16'sh18B2;
+    angle_table[15][0]=16'sh37A5; angle_table[15][1]=16'sh1F74; angle_table[15][2]=16'shEB1D; angle_table[15][3]=16'sh1661;
+    angle_table[16][0]=16'sh3642; angle_table[16][1]=16'sh2121; angle_table[16][2]=16'shE9DE; angle_table[16][3]=16'sh13F7;
+    angle_table[17][0]=16'sh3505; angle_table[17][1]=16'sh2326; angle_table[17][2]=16'shE8D7; angle_table[17][3]=16'sh1170;
+    angle_table[18][0]=16'sh33D6; angle_table[18][1]=16'sh2528; angle_table[18][2]=16'shE7D8; angle_table[18][3]=16'sh0ECC;
+    angle_table[19][0]=16'sh3237; angle_table[19][1]=16'sh26A8; angle_table[19][2]=16'shE7AC; angle_table[19][3]=16'sh0C11;
+    angle_table[20][0]=16'sh30FC; angle_table[20][1]=16'sh2855; angle_table[20][2]=16'shE7AB; angle_table[20][3]=16'sh094A;
+    angle_table[21][0]=16'sh2F6C; angle_table[21][1]=16'sh29F7; angle_table[21][2]=16'shE7D1; angle_table[21][3]=16'sh0673;
+    angle_table[22][0]=16'sh2D41; angle_table[22][1]=16'sh2B89; angle_table[22][2]=16'shE81F; angle_table[22][3]=16'sh0390;
+    angle_table[23][0]=16'sh2B1F; angle_table[23][1]=16'sh2D0E; angle_table[23][2]=16'shE894; angle_table[23][3]=16'sh00A5;
+    angle_table[24][0]=16'sh28F5; angle_table[24][1]=16'sh2E84; angle_table[24][2]=16'shE929; angle_table[24][3]=16'shFDB6;
+    angle_table[25][0]=16'sh26A8; angle_table[25][1]=16'sh2FEB; angle_table[25][2]=16'shE9DE; angle_table[25][3]=16'shFAC7;
+    angle_table[26][0]=16'sh2449; angle_table[26][1]=16'sh3142; angle_table[26][2]=16'shEAB1; angle_table[26][3]=16'shF7DB;
+    angle_table[27][0]=16'sh21E1; angle_table[27][1]=16'sh3289; angle_table[27][2]=16'shEBA3; angle_table[27][3]=16'shF4F7;
+    angle_table[28][0]=16'sh1F6A; angle_table[28][1]=16'sh33C0; angle_table[28][2]=16'shECB2; angle_table[28][3]=16'shF21C;
+    angle_table[29][0]=16'sh1CE8; angle_table[29][1]=16'sh34E7; angle_table[29][2]=16'shEDDD; angle_table[29][3]=16'shEF4D;
+    angle_table[30][0]=16'sh1A5A; angle_table[30][1]=16'sh35FD; angle_table[30][2]=16'shEF24; angle_table[30][3]=16'shEC8C;
+    angle_table[31][0]=16'sh17C3; angle_table[31][1]=16'sh3702; angle_table[31][2]=16'shF086; angle_table[31][3]=16'shE9DC;
+    angle_table[32][0]=16'sh1000; angle_table[32][1]=16'sh3800; angle_table[32][2]=16'shF200; angle_table[32][3]=16'shE800;
+    angle_table[33][0]=16'sh1253; angle_table[33][1]=16'sh38F5; angle_table[33][2]=16'shF38E; angle_table[33][3]=16'shE567;
+    angle_table[34][0]=16'sh0F8C; angle_table[34][1]=16'sh39DA; angle_table[34][2]=16'shF52E; angle_table[34][3]=16'shE2D8;
+    angle_table[35][0]=16'sh0CB9; angle_table[35][1]=16'sh3AAF; angle_table[35][2]=16'shF6E0; angle_table[35][3]=16'shE057;
+    angle_table[36][0]=16'sh09DE; angle_table[36][1]=16'sh3B75; angle_table[36][2]=16'shF8A2; angle_table[36][3]=16'shDDE6;
+    angle_table[37][0]=16'sh06FA; angle_table[37][1]=16'sh3C2A; angle_table[37][2]=16'shFA75; angle_table[37][3]=16'shDB88;
+    angle_table[38][0]=16'sh0412; angle_table[38][1]=16'sh3CCF; angle_table[38][2]=16'shFC56; angle_table[38][3]=16'shD940;
+    angle_table[39][0]=16'sh0127; angle_table[39][1]=16'sh3D64; angle_table[39][2]=16'shFE45; angle_table[39][3]=16'shD710;
+    angle_table[40][0]=16'shFE39; angle_table[40][1]=16'sh3DEA; angle_table[40][2]=16'sh003A; angle_table[40][3]=16'shD4F9;
+    angle_table[41][0]=16'shFB4B; angle_table[41][1]=16'sh3E5F; angle_table[41][2]=16'sh0235; angle_table[41][3]=16'shD303;
+    angle_table[42][0]=16'shF860; angle_table[42][1]=16'sh3EC5; angle_table[42][2]=16'sh0434; angle_table[42][3]=16'shD12F;
+    angle_table[43][0]=16'shF578; angle_table[43][1]=16'sh3F1B; angle_table[43][2]=16'sh0633; angle_table[43][3]=16'shCF81;
+    angle_table[44][0]=16'shF297; angle_table[44][1]=16'sh3F62; angle_table[44][2]=16'sh082F; angle_table[44][3]=16'shCDFA;
+    angle_table[45][0]=16'shEFBE; angle_table[45][1]=16'sh3F99; angle_table[45][2]=16'sh0A27; angle_table[45][3]=16'shCC9C;
+    angle_table[46][0]=16'shECEF; angle_table[46][1]=16'sh3FC1; angle_table[46][2]=16'sh0C17; angle_table[46][3]=16'shCB68;
+    angle_table[47][0]=16'shEA2C; angle_table[47][1]=16'sh3FD9; angle_table[47][2]=16'sh0E00; angle_table[47][3]=16'shCA5F;
+    angle_table[48][0]=16'shE000; angle_table[48][1]=16'sh4000; angle_table[48][2]=16'sh0000; angle_table[48][3]=16'shD59A;
+    angle_table[49][0]=16'shE49A; angle_table[49][1]=16'sh3FF6; angle_table[49][2]=16'sh017C; angle_table[49][3]=16'shD5B0;
+    angle_table[50][0]=16'shE749; angle_table[50][1]=16'sh3FD9; angle_table[50][2]=16'sh02F7; angle_table[50][3]=16'shD5FB;
+    angle_table[51][0]=16'shEA05; angle_table[51][1]=16'sh3FA9; angle_table[51][2]=16'sh0470; angle_table[51][3]=16'shD67A;
+    angle_table[52][0]=16'shECCE; angle_table[52][1]=16'sh3F67; angle_table[52][2]=16'sh05E6; angle_table[52][3]=16'shD72D;
+    angle_table[53][0]=16'shEFA3; angle_table[53][1]=16'sh3F0D; angle_table[53][2]=16'sh075A; angle_table[53][3]=16'shD812;
+    angle_table[54][0]=16'shF283; angle_table[54][1]=16'sh3EA2; angle_table[54][2]=16'sh08CA; angle_table[54][3]=16'shD928;
+    angle_table[55][0]=16'shF56C; angle_table[55][1]=16'sh3E26; angle_table[55][2]=16'sh0A36; angle_table[55][3]=16'shDA6E;
+    angle_table[56][0]=16'shF858; angle_table[56][1]=16'sh3D9B; angle_table[56][2]=16'sh0B9E; angle_table[56][3]=16'shDBDC;
+    angle_table[57][0]=16'shFB47; angle_table[57][1]=16'sh3CF7; angle_table[57][2]=16'sh0D01; angle_table[57][3]=16'shDD70;
+    angle_table[58][0]=16'shFE38; angle_table[58][1]=16'sh3C42; angle_table[58][2]=16'sh0E60; angle_table[58][3]=16'shDF28;
+    angle_table[59][0]=16'sh0129; angle_table[59][1]=16'sh3B78; angle_table[59][2]=16'sh0FBA; angle_table[59][3]=16'shE103;
+    angle_table[60][0]=16'sh0418; angle_table[60][1]=16'sh3A9D; angle_table[60][2]=16'sh110E; angle_table[60][3]=16'shE2FE;
+    angle_table[61][0]=16'sh0703; angle_table[61][1]=16'sh39B3; angle_table[61][2]=16'sh125B; angle_table[61][3]=16'shE518;
+    angle_table[62][0]=16'sh09E8; angle_table[62][1]=16'sh38B3; angle_table[62][2]=16'sh13A2; angle_table[62][3]=16'shE74D;
+    angle_table[63][0]=16'sh0CC5; angle_table[63][1]=16'sh37A5; angle_table[63][2]=16'sh14E3; angle_table[63][3]=16'shE99B;
+end
+
+reg [5:0] angle_idx = 6'd0;
+wire signed [15:0] dir_x   = angle_table[angle_idx][0];
+wire signed [15:0] dir_y   = angle_table[angle_idx][1];
+wire signed [15:0] plane_x = angle_table[angle_idx][2];
+wire signed [15:0] plane_y = angle_table[angle_idx][3];
+
+// ─── Map ──────────────────────────────────────────────────────────────────────
+reg [3:0] map_data [0:255];
+wire [1023:0] map_flat;
+integer mi;
+initial begin
+    for (mi=0; mi<256; mi=mi+1) map_data[mi]=4'd0;
+    begin : fb integer bi;
+        for (bi=0; bi<16; bi=bi+1) begin
+            map_data[  0*16+bi]=4'd1; map_data[15*16+bi]=4'd1;
+            map_data[bi*16+  0]=4'd1; map_data[bi*16+15]=4'd1;
+        end
+    end
+    map_data[ 2*16+2]=4'd2; map_data[ 2*16+3]=4'd2; map_data[2*16+4]=4'd2;
+    map_data[ 3*16+4]=4'd2; map_data[ 4*16+4]=4'd2;
+    map_data[ 2*16+9]=4'd3; map_data[ 3*16+9]=4'd3;
+    map_data[ 4*16+9]=4'd3; map_data[ 4*16+8]=4'd3;
+    map_data[ 7*16+2]=4'd4; map_data[ 7*16+3]=4'd4;
+    map_data[ 8*16+6]=4'd2; map_data[ 9*16+6]=4'd2;
+    map_data[ 9*16+7]=4'd2; map_data[ 9*16+8]=4'd2;
+    map_data[ 6*16+12]=4'd3; map_data[7*16+12]=4'd3;
+    map_data[11*16+3]=4'd4; map_data[11*16+4]=4'd4;
+    map_data[12*16+5]=4'd4; map_data[13*16+5]=4'd4;
+    map_data[11*16+9]=4'd1; map_data[11*16+10]=4'd1;
+    map_data[13*16+10]=4'd1; map_data[13*16+11]=4'd1;
+end
+genvar gmi2;
+generate
+    for (gmi2=0; gmi2<256; gmi2=gmi2+1)
+        assign map_flat[gmi2*4 +: 4] = map_data[gmi2];
+endgenerate
+
+// ─── Player ───────────────────────────────────────────────────────────────────
+reg signed [15:0] pos_x = 16'h0380;
+reg signed [15:0] pos_y = 16'h0380;
+
+// ─── Double frame buffer via xpm_memory_sdpram ────────────────────────────────
+// buf0: written when write_buf==0, read when write_buf==1 (and vice versa)
+// buf1: written when write_buf==1, read when write_buf==0
+reg        write_buf = 1'b0;
+
+// Write port signals (raycaster side)
+reg        fb_we    = 1'b0;
+reg [8:0]  fb_waddr = 9'd0;
+reg [19:0] fb_wdata = 20'd0;
+
+// Read port signals (VGA side) — address registered one cycle ahead
+wire [8:0]  scol    = hcnt[9:1];
+wire [19:0] fb0_rdata, fb1_rdata;
+
+xpm_sdpram_wrap buf0 (
+    .clk   (CLK),
+    .we    (fb_we && (write_buf == 1'b0)),
+    .waddr (fb_waddr),
+    .wdata (fb_wdata),
+    .raddr (scol),
+    .rdata (fb0_rdata)
+);
+
+xpm_sdpram_wrap buf1 (
+    .clk   (CLK),
+    .we    (fb_we && (write_buf == 1'b1)),
+    .waddr (fb_waddr),
+    .wdata (fb_wdata),
+    .raddr (scol),
+    .rdata (fb1_rdata)
+);
+
+// Select the buffer not currently being written for display
+wire [19:0] vga_entry = (write_buf == 1'b1) ? fb0_rdata : fb1_rdata;
+
+// ─── RayCaster ────────────────────────────────────────────────────────────────
+reg  [8:0] cam_x      = 9'd0;
+wire [7:0] line_height_out;
+wire [3:0] line_color_out;
+wire       cast_busy, cast_done;
+reg        cast_start = 1'b0;
+reg  [7:0] lh_latch   = 8'd0;
+reg  [3:0] lc_latch   = 4'd0;
+
+RayCaster rc (
+    .clk(CLK), .rst(rst), .cam_x(cam_x),
+    .pos_x(pos_x), .pos_y(pos_y),
+    .dir_x(dir_x), .dir_y(dir_y),
+    .plane_x(plane_x), .plane_y(plane_y),
+    .map_flat(map_flat),
+    .start(cast_start), .busy(cast_busy), .done(cast_done),
+    .line_height(line_height_out), .line_color(line_color_out)
+);
+
+// ─── Frame orchestrator FSM ───────────────────────────────────────────────────
+localparam [1:0] FS_WAIT=2'd0, FS_MOVE=2'd1, FS_CAST=2'd2, FS_STORE=2'd3;
+reg [1:0] fs = FS_WAIT;
+
+always @(posedge CLK) begin
+    if (rst) begin
+        fs<=FS_WAIT; cam_x<=0; cast_start<=0;
+        pos_x<=16'h0380; pos_y<=16'h0380; angle_idx<=0;
+        write_buf<=0; lh_latch<=0; lc_latch<=0;
+        fb_we<=0; fb_waddr<=0; fb_wdata<=0;
+    end else begin
+        fb_we <= 1'b0; // default: no write
+
+        case (fs)
+        FS_WAIT: begin
+            cast_start <= 1'b0;
+            if (frame_start) begin
+                write_buf <= ~write_buf;
+                fs        <= FS_MOVE;
+            end
+        end
+
+        FS_MOVE: begin : do_move
+            reg signed [15:0] nx, ny; reg [3:0] mcx, mcy;
+            nx=pos_x; ny=pos_y;
+            if (btn_u) begin nx=pos_x+(dir_x>>>7); ny=pos_y+(dir_y>>>7); end
+            if (btn_d) begin nx=pos_x-(dir_x>>>7); ny=pos_y-(dir_y>>>7); end
+            mcx=nx[11:8]; mcy=ny[11:8];
+            if      (map_data[{mcy,mcx}]        ==4'd0) begin pos_x<=nx; pos_y<=ny; end
+            else if (map_data[{pos_y[11:8],mcx}]==4'd0) pos_x<=nx;
+            else if (map_data[{mcy,pos_x[11:8]}]==4'd0) pos_y<=ny;
+            if (btn_l) angle_idx<=angle_idx-6'd1;
+            if (btn_r) angle_idx<=angle_idx+6'd1;
+            if (btn_c) begin pos_x<=16'h0380; pos_y<=16'h0380; angle_idx<=0; end
+            cam_x<=9'd0; fs<=FS_CAST;
+        end
+
+        FS_CAST: begin
+            if (!cast_busy && !cast_done) cast_start<=1'b1;
+            if (cast_done) begin
+                cast_start<=1'b0;
+                lh_latch<=line_height_out;
+                lc_latch<=line_color_out;
+                fs<=FS_STORE;
+            end
+        end
+
+        FS_STORE: begin : do_store
+            reg [7:0] half, top8, bot8;
+            half = {1'b0, lh_latch[7:1]};
+            top8 = (half>=8'd120) ? 8'd0   : (8'd120-half);
+            bot8 = (half>=8'd120) ? 8'd240 : (8'd120+half);
+            fb_we    <= 1'b1;
+            fb_waddr <= cam_x;
+            fb_wdata <= {bot8, top8, lc_latch};
+            if (cam_x==9'd319) begin cam_x<=9'd0; fs<=FS_WAIT; end
+            else               begin cam_x<=cam_x+9'd1; fs<=FS_CAST; end
+        end
+
+        default: fs<=FS_WAIT;
+        endcase
+    end
+end
+
+// ─── VGA pixel output ─────────────────────────────────────────────────────────
+wire [7:0] srow = vcnt[8:1];
+
+// BRAM read latency is 1 cycle — vga_entry is already one cycle delayed
+wire [7:0] wtop = vga_entry[11:4];
+wire [7:0] wbot = vga_entry[19:12];
+wire [3:0] wcol = vga_entry[3:0];
+
+wire is_wall = (srow >= wtop) && (srow < wbot);
+wire is_ceil = (srow < wtop);
+
+reg [3:0] R=0, G=0, B=0;
+always @(posedge CLK) begin
+    if (!video_on) begin R<=0; G<=0; B<=0;
+    end else if (is_wall) begin
+        case (wcol[2:0])
+            3'd1: begin R<=wcol[3]?4'd7:4'd12; G<=wcol[3]?4'd1:4'd2;  B<=wcol[3]?4'd1:4'd2;  end
+            3'd2: begin R<=wcol[3]?4'd1:4'd2;  G<=wcol[3]?4'd6:4'd10; B<=wcol[3]?4'd1:4'd2;  end
+            3'd3: begin R<=wcol[3]?4'd1:4'd2;  G<=wcol[3]?4'd2:4'd3;  B<=wcol[3]?4'd7:4'd12; end
+            3'd4: begin R<=wcol[3]?4'd8:4'd13; G<=wcol[3]?4'd6:4'd10; B<=4'd1;                end
+            default: begin R<=4'd5; G<=4'd5; B<=4'd5; end
+        endcase
+    end else if (is_ceil) begin R<=4'd3; G<=4'd3; B<=4'd6;
+    end else              begin R<=4'd6; G<=4'd4; B<=4'd1; end
+end
+
+assign VGA_R = R;
+assign VGA_G = G;
+assign VGA_B = B;
+
+endmodule
+`default_nettype wire
