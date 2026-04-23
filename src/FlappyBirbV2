@@ -1,0 +1,620 @@
+`timescale 1ns / 1ps
+
+module top (
+    input  wire        clk,
+    input  wire        BTNL,
+    input  wire        BTNR,
+    input  wire        BTNU,
+    input  wire        BTND,
+    output reg         Hsync,
+    output reg         Vsync,
+    output reg  [3:0]  Red,
+    output reg  [3:0]  Green,
+    output reg  [3:0]  Blue
+);
+
+// ============================================================================
+// Reset / clocks
+// ============================================================================
+
+reg [3:0] rst_sr = 4'b1111;
+wire rst = rst_sr[0];
+always @(posedge clk)
+    rst_sr <= {1'b0, rst_sr[3:1]};
+
+reg [1:0] clk_div = 0;
+wire pixel_tick = (clk_div == 2'd0);
+always @(posedge clk)
+    clk_div <= clk_div + 1'b1;
+
+// ============================================================================
+// VGA timing 640x480@60
+// ============================================================================
+
+reg [9:0] hcnt = 0, vcnt = 0;
+
+always @(posedge clk) begin
+    if (pixel_tick) begin
+        if (hcnt == 10'd799) begin
+            hcnt <= 10'd0;
+            vcnt <= (vcnt == 10'd524) ? 10'd0 : (vcnt + 10'd1);
+        end else begin
+            hcnt <= hcnt + 10'd1;
+        end
+    end
+end
+
+wire hsync_active = (hcnt >= 10'd656) && (hcnt < 10'd752);
+wire vsync_active = (vcnt >= 10'd490) && (vcnt < 10'd492);
+wire video_on     = (hcnt < 10'd640) && (vcnt < 10'd480);
+
+reg vsync_r = 1'b0;
+always @(posedge clk)
+    vsync_r <= vsync_active;
+
+always @(posedge clk) begin
+    Hsync <= ~hsync_active;
+    Vsync <= ~vsync_active;
+end
+
+// ============================================================================
+// Button sync + debounce
+// ============================================================================
+
+reg [1:0] sync_l=0, sync_r=0, sync_u=0, sync_d=0;
+always @(posedge clk) begin
+    sync_l <= {sync_l[0], BTNL};
+    sync_r <= {sync_r[0], BTNR};
+    sync_u <= {sync_u[0], BTNU};
+    sync_d <= {sync_d[0], BTND};
+end
+
+reg [19:0] db_cnt_l=0, db_cnt_r=0, db_cnt_u=0, db_cnt_d=0;
+reg btn_l=0, btn_r=0, btn_u=0, btn_d=0;
+
+always @(posedge clk) begin
+    if (sync_l[1] == btn_l) db_cnt_l <= 20'd0;
+    else begin
+        db_cnt_l <= db_cnt_l + 20'd1;
+        if (db_cnt_l == 20'hFFFFF) btn_l <= sync_l[1];
+    end
+    if (sync_r[1] == btn_r) db_cnt_r <= 20'd0;
+    else begin
+        db_cnt_r <= db_cnt_r + 20'd1;
+        if (db_cnt_r == 20'hFFFFF) btn_r <= sync_r[1];
+    end
+    if (sync_u[1] == btn_u) db_cnt_u <= 20'd0;
+    else begin
+        db_cnt_u <= db_cnt_u + 20'd1;
+        if (db_cnt_u == 20'hFFFFF) btn_u <= sync_u[1];
+    end
+    if (sync_d[1] == btn_d) db_cnt_d <= 20'd0;
+    else begin
+        db_cnt_d <= db_cnt_d + 20'd1;
+        if (db_cnt_d == 20'hFFFFF) btn_d <= sync_d[1];
+    end
+end
+
+wire any_btn = btn_l | btn_r | btn_u | btn_d;
+
+// ============================================================================
+// One-shot button event latches
+// ============================================================================
+
+reg prev_btn_l_d = 0, prev_btn_r_d = 0, prev_btn_u_d = 0;
+reg btn_l_event  = 0, btn_r_event  = 0, btn_u_event  = 0;
+
+// ============================================================================
+// Splash
+// ============================================================================
+
+reg splash_mode = 1'b1;
+always @(posedge clk) begin
+    if (rst)          splash_mode <= 1'b1;
+    else if (any_btn) splash_mode <= 1'b0;
+end
+
+localparam IMG_W  = 320;
+localparam IMG_H  = 240;
+localparam PIXELS = IMG_W * IMG_H; // 76800
+
+(* rom_style = "block" *) reg [11:0] frame_rom [0:PIXELS-1];
+initial $readmemh("START.hex", frame_rom);
+
+// Pipeline stage 1: compute address on pixel_tick boundary
+wire [9:0] h_early = hcnt - 10'd1;
+wire [8:0] img_x   = h_early[9:1];   // divide by 2 (pixel double)
+wire [7:0] img_y   = vcnt[8:1];      // divide by 2 (pixel double)
+wire       in_image = (img_x < IMG_W) && (img_y < IMG_H);
+
+// img_y * 320 = img_y * 256 + img_y * 64
+wire [16:0] rom_addr =
+    in_image ? (({9'd0, img_y} << 8) + ({9'd0, img_y} << 6) + {8'd0, img_x}) : 17'd0;
+
+// Registered ROM address (aligned to pixel_tick)
+reg [16:0] rom_addr_r = 0;
+always @(posedge clk)
+    if (pixel_tick) rom_addr_r <= rom_addr;
+
+// BRAM read - 1 cycle latency
+reg [11:0] splash_pixel = 12'h000;
+always @(posedge clk)
+    splash_pixel <= frame_rom[rom_addr_r];
+
+// video_on delayed 2 cycles to match BRAM + address register latency
+reg video_on_r1 = 0, video_on_r2 = 0;
+always @(posedge clk) begin
+    video_on_r1 <= video_on;
+    video_on_r2 <= video_on_r1;
+end
+
+// ============================================================================
+// Memories shared by renderer + CPU
+// ============================================================================
+
+reg [11:0] palette      [0:15];
+reg [3:0]  tile_gfx     [0:511];
+reg [4:0]  tilemap      [0:959];
+reg [15:0] sprite_table [0:7];
+reg [15:0] program_rom  [0:255];
+reg [15:0] registers    [0:15];
+reg [7:0]  pc;
+
+// ============================================================================
+// Background tile renderer
+// ============================================================================
+
+wire [4:0] tile_col    = hcnt / 10'd20;
+wire [4:0] tile_row    = vcnt[8:4];
+wire [1:0] px_in_tile  = (hcnt % 10'd20) / 10'd5;
+wire [1:0] py_in_tile  = vcnt[3:2];
+
+wire [9:0]  tm_addr    = {tile_row, 5'b00000} + tile_col;
+wire [4:0]  bg_tid     = tilemap[tm_addr];
+wire [8:0]  bg_gaddr   = {bg_tid, py_in_tile, px_in_tile};
+wire [3:0]  bg_pal     = tile_gfx[bg_gaddr];
+wire [11:0] bg_colour  = palette[bg_pal];
+
+// ============================================================================
+// Direct pixel bird renderer
+// R1 = tile column (20px steps), R2 = quarter-row (4px steps)
+// Bird = 40x32 px, tiles 4/5/6/7 in 2x2 arrangement
+// ============================================================================
+
+wire [9:0] bird_x_px = ({5'd0, registers[1][4:0]} << 4) +
+                       ({5'd0, registers[1][4:0]} << 2); // col * 20
+wire [9:0] bird_y_px = {registers[2][7:0], 2'b00};      // qrow * 4
+
+wire bird_on =
+    (hcnt >= bird_x_px) && (hcnt < (bird_x_px + 10'd40)) &&
+    (vcnt >= bird_y_px) && (vcnt < (bird_y_px + 10'd32));
+
+wire [5:0] bird_dx = hcnt - bird_x_px;
+wire [4:0] bird_dy = vcnt - bird_y_px;
+
+reg [2:0] bird_px_full;
+always @(*) begin
+    if      (bird_dx <  6'd5)  bird_px_full = 3'd0;
+    else if (bird_dx < 6'd10)  bird_px_full = 3'd1;
+    else if (bird_dx < 6'd15)  bird_px_full = 3'd2;
+    else if (bird_dx < 6'd20)  bird_px_full = 3'd3;
+    else if (bird_dx < 6'd25)  bird_px_full = 3'd4;
+    else if (bird_dx < 6'd30)  bird_px_full = 3'd5;
+    else if (bird_dx < 6'd35)  bird_px_full = 3'd6;
+    else                       bird_px_full = 3'd7;
+end
+
+wire [2:0] bird_py_full = bird_dy[4:2]; // /4
+
+wire [4:0] bird_tid =
+    ({bird_py_full[2], bird_px_full[2]} == 2'b00) ? 5'd4 :
+    ({bird_py_full[2], bird_px_full[2]} == 2'b01) ? 5'd5 :
+    ({bird_py_full[2], bird_px_full[2]} == 2'b10) ? 5'd6 : 5'd7;
+
+wire [8:0]  bird_gaddr  = {bird_tid, bird_py_full[1:0], bird_px_full[1:0]};
+wire [3:0]  bird_pal    = bird_on ? tile_gfx[bird_gaddr] : 4'd0;
+wire [11:0] bird_colour = palette[bird_pal];
+
+wire [11:0] game_pixel_colour =
+    (bird_on && (bird_pal != 4'h0)) ? bird_colour : bg_colour;
+
+// ============================================================================
+// Output pipeline - 1-cycle register to ease timing
+// ============================================================================
+
+reg        splash_mode_r = 1'b1;
+reg [11:0] game_pixel_r  = 12'h000;
+
+always @(posedge clk) begin
+    splash_mode_r <= splash_mode;
+    game_pixel_r  <= game_pixel_colour;
+end
+
+// Splash uses video_on_r2 (2-cycle delay matching BRAM pipeline)
+// Game  uses video_on_r1 (1-cycle delay matching game_pixel_r register)
+always @(posedge clk) begin
+    if (splash_mode_r) begin
+        if (video_on_r2) {Red, Green, Blue} <= splash_pixel;
+        else             {Red, Green, Blue} <= 12'h000;
+    end else begin
+        if (video_on_r1) {Red, Green, Blue} <= game_pixel_r;
+        else             {Red, Green, Blue} <= 12'h000;
+    end
+end
+
+// ============================================================================
+// Palette init
+// ============================================================================
+
+integer pi;
+initial begin
+    for (pi = 0; pi < 16; pi = pi + 1) palette[pi] = 12'h000;
+    palette[ 0] = 12'h000;
+    palette[ 1] = 12'h58D;
+    palette[ 2] = 12'h0B4;
+    palette[ 3] = 12'hFFF;
+    palette[ 4] = 12'hF22;
+    palette[ 5] = 12'hFA0;
+    palette[ 6] = 12'h333;
+    palette[ 7] = 12'hFF0;
+    palette[ 8] = 12'hF00;
+    palette[ 9] = 12'hFFF;
+    palette[10] = 12'h900;
+end
+
+// ============================================================================
+// Tile graphics init
+// ============================================================================
+
+integer gi;
+initial begin
+    for (gi = 0; gi < 512; gi = gi + 1) tile_gfx[gi] = 4'h0;
+
+    // Tile 0: Sky
+    tile_gfx[0]=4'd1;  tile_gfx[1]=4'd1;  tile_gfx[2]=4'd1;  tile_gfx[3]=4'd1;
+    tile_gfx[4]=4'd1;  tile_gfx[5]=4'd1;  tile_gfx[6]=4'd1;  tile_gfx[7]=4'd1;
+    tile_gfx[8]=4'd1;  tile_gfx[9]=4'd1;  tile_gfx[10]=4'd1; tile_gfx[11]=4'd1;
+    tile_gfx[12]=4'd1; tile_gfx[13]=4'd1; tile_gfx[14]=4'd1; tile_gfx[15]=4'd1;
+
+    // Tile 1: Pipe body
+    tile_gfx[16]=4'd2; tile_gfx[17]=4'd2; tile_gfx[18]=4'd2; tile_gfx[19]=4'd2;
+    tile_gfx[20]=4'd2; tile_gfx[21]=4'd2; tile_gfx[22]=4'd2; tile_gfx[23]=4'd2;
+    tile_gfx[24]=4'd2; tile_gfx[25]=4'd2; tile_gfx[26]=4'd2; tile_gfx[27]=4'd2;
+    tile_gfx[28]=4'd2; tile_gfx[29]=4'd2; tile_gfx[30]=4'd2; tile_gfx[31]=4'd2;
+
+    // Tile 2: Pipe cap
+    tile_gfx[32]=4'd3; tile_gfx[33]=4'd3; tile_gfx[34]=4'd3; tile_gfx[35]=4'd3;
+    tile_gfx[36]=4'd3; tile_gfx[37]=4'd2; tile_gfx[38]=4'd2; tile_gfx[39]=4'd3;
+    tile_gfx[40]=4'd3; tile_gfx[41]=4'd2; tile_gfx[42]=4'd2; tile_gfx[43]=4'd3;
+    tile_gfx[44]=4'd3; tile_gfx[45]=4'd3; tile_gfx[46]=4'd3; tile_gfx[47]=4'd3;
+
+    // Tile 3: Cloud
+    tile_gfx[48]=4'd1; tile_gfx[49]=4'd3; tile_gfx[50]=4'd3; tile_gfx[51]=4'd1;
+    tile_gfx[52]=4'd3; tile_gfx[53]=4'd3; tile_gfx[54]=4'd3; tile_gfx[55]=4'd3;
+    tile_gfx[56]=4'd3; tile_gfx[57]=4'd3; tile_gfx[58]=4'd3; tile_gfx[59]=4'd3;
+    tile_gfx[60]=4'd1; tile_gfx[61]=4'd1; tile_gfx[62]=4'd1; tile_gfx[63]=4'd1;
+
+    // Tile 4: Bird TL
+    tile_gfx[64]=4'd8;  tile_gfx[65]=4'd8;  tile_gfx[66]=4'd8;  tile_gfx[67]=4'd8;
+    tile_gfx[68]=4'd8;  tile_gfx[69]=4'd10; tile_gfx[70]=4'd10; tile_gfx[71]=4'd8;
+    tile_gfx[72]=4'd8;  tile_gfx[73]=4'd10; tile_gfx[74]=4'd0;  tile_gfx[75]=4'd8;
+    tile_gfx[76]=4'd0;  tile_gfx[77]=4'd0;  tile_gfx[78]=4'd0;  tile_gfx[79]=4'd8;
+
+    // Tile 5: Bird TR
+    tile_gfx[80]=4'd8;  tile_gfx[81]=4'd8;  tile_gfx[82]=4'd8;  tile_gfx[83]=4'd8;
+    tile_gfx[84]=4'd8;  tile_gfx[85]=4'd10; tile_gfx[86]=4'd10; tile_gfx[87]=4'd8;
+    tile_gfx[88]=4'd8;  tile_gfx[89]=4'd0;  tile_gfx[90]=4'd10; tile_gfx[91]=4'd8;
+    tile_gfx[92]=4'd8;  tile_gfx[93]=4'd0;  tile_gfx[94]=4'd0;  tile_gfx[95]=4'd0;
+
+    // Tile 6: Bird BL
+    tile_gfx[96]=4'd0;  tile_gfx[97]=4'd8;  tile_gfx[98]=4'd8;  tile_gfx[99]=4'd8;
+    tile_gfx[100]=4'd0; tile_gfx[101]=4'd10; tile_gfx[102]=4'd10; tile_gfx[103]=4'd8;
+    tile_gfx[104]=4'd0; tile_gfx[105]=4'd0;  tile_gfx[106]=4'd0;  tile_gfx[107]=4'd8;
+    tile_gfx[108]=4'd0; tile_gfx[109]=4'd0;  tile_gfx[110]=4'd0;  tile_gfx[111]=4'd8;
+
+    // Tile 7: Bird BR
+    tile_gfx[112]=4'd8; tile_gfx[113]=4'd8;  tile_gfx[114]=4'd8;  tile_gfx[115]=4'd0;
+    tile_gfx[116]=4'd8; tile_gfx[117]=4'd10; tile_gfx[118]=4'd10; tile_gfx[119]=4'd0;
+    tile_gfx[120]=4'd8; tile_gfx[121]=4'd0;  tile_gfx[122]=4'd0;  tile_gfx[123]=4'd0;
+    tile_gfx[124]=4'd8; tile_gfx[125]=4'd0;  tile_gfx[126]=4'd0;  tile_gfx[127]=4'd0;
+end
+
+// ============================================================================
+// Tilemap init
+// ============================================================================
+
+integer ti;
+initial begin
+    for (ti = 0; ti < 960; ti = ti + 1)
+        tilemap[ti] = (ti < 768) ? 5'd0 : 5'd1;
+
+    tilemap[3*32+8]=5'd3;  tilemap[3*32+9]=5'd3;
+    tilemap[5*32+20]=5'd3; tilemap[5*32+21]=5'd3; tilemap[5*32+22]=5'd3;
+    tilemap[1*32+15]=5'd3; tilemap[1*32+16]=5'd3;
+
+    tilemap[0*32+28]=5'd1; tilemap[0*32+29]=5'd1;
+    tilemap[1*32+28]=5'd1; tilemap[1*32+29]=5'd1;
+    tilemap[2*32+28]=5'd1; tilemap[2*32+29]=5'd1;
+    tilemap[3*32+28]=5'd1; tilemap[3*32+29]=5'd1;
+    tilemap[4*32+28]=5'd1; tilemap[4*32+29]=5'd1;
+    tilemap[5*32+28]=5'd1; tilemap[5*32+29]=5'd1;
+    tilemap[6*32+28]=5'd1; tilemap[6*32+29]=5'd1;
+    tilemap[7*32+28]=5'd1; tilemap[7*32+29]=5'd1;
+    tilemap[8*32+28]=5'd1; tilemap[8*32+29]=5'd1;
+    tilemap[9*32+28]=5'd1; tilemap[9*32+29]=5'd1;
+    tilemap[10*32+28]=5'd2; tilemap[10*32+29]=5'd2;
+end
+
+// ============================================================================
+// Sprite table init
+// ============================================================================
+
+integer s;
+initial begin
+    for (s = 0; s < 8; s = s + 1)
+        sprite_table[s] = 16'h0000;
+end
+
+// ============================================================================
+// Program ROM
+// ============================================================================
+
+integer fi;
+initial begin
+    for (fi = 0; fi < 256; fi = fi + 1)
+        program_rom[fi] = 16'b1111_0000_0000_0000;
+
+    program_rom[  0] = 16'b1100000100001000; // SETX R1,8
+    program_rom[  1] = 16'b1100001000101000; // SETX R2,40
+    program_rom[  2] = 16'b1100011100011111; // SETX R7,31
+    program_rom[  3] = 16'b1101110100000001; // ADDI R13,R0,1
+    program_rom[  4] = 16'b1101100000000000; // ADDI R8,R0,0
+    program_rom[  5] = 16'b1100010101101100; // SETX R5,108
+    program_rom[  6] = 16'b1100111000011100; // SETX R14,28
+    program_rom[  7] = 16'b1100111100000000; // SETX R15,0
+
+    program_rom[  8] = 16'b1110110000000000; // IN R12,vsync
+    program_rom[  9] = 16'b1011101110110000; // NOP
+    program_rom[ 10] = 16'b1010000011001101; // BLT R12,R13 -> 8
+    program_rom[ 11] = 16'b1110110000000000; // IN R12,vsync
+    program_rom[ 12] = 16'b1011101110110000; // NOP
+    program_rom[ 13] = 16'b1011101110110000; // NOP
+    program_rom[ 14] = 16'b1010000000001100; // BLT R0,R12 -> 11
+
+    program_rom[ 15] = 16'b1011101110110000; // NOP
+    program_rom[ 16] = 16'b1110010000100000; // IN R4,btn_l_event
+
+    // -------------------------------------------------------
+    // JUMP GATE FIX: only latch jump if velocity >= 0 (not already rising)
+    // R9 = sign bit of R8 (1 if negative/rising, 0 if falling/still)
+    // R11 = NOT R9 = 1 if we CAN jump, 0 if we cannot
+    // R11 = R11 AND R4 = pass btn event only when allowed
+    // -------------------------------------------------------
+    program_rom[ 17] = 16'b0111100110001111; // SHR R9,R8,15    extract velocity sign bit
+    program_rom[ 18] = 16'b0101101110010000; // NOT R11,R9       invert: 1=can jump
+    program_rom[ 19] = 16'b0011101110110100; // AND R11,R11,R4   gate with button event
+    program_rom[ 20] = 16'b0100001100111011; // OR  R3,R3,R11    latch only if allowed
+    // -------------------------------------------------------
+
+    program_rom[ 21] = 16'b1110010001000000; // IN R4,btn_u_event
+
+    // -------------------------------------------------------
+    // GRAVITY TICKER (FIX: mod-4 = gravity pulse every 4 frames)
+    // -------------------------------------------------------
+    program_rom[ 22] = 16'b0001101010101101; // ADD R10,R10,R13  frame_counter++
+    program_rom[ 23] = 16'b0111100110100010; // SHR R9,R10,2     pulse = counter>>2
+    program_rom[ 24] = 16'b0110110010010010; // SHL R12,R9,2     R12 = pulse<<2
+    program_rom[ 25] = 16'b0010101010101100; // SUB R10,R10,R12  counter mod 4
+    program_rom[ 26] = 16'b0001100010001001; // ADD R8,R8,R9     velocity += pulse
+    // -------------------------------------------------------
+
+    program_rom[ 27] = 16'b0011101100111001; // AND R11,R3,R9
+    program_rom[ 28] = 16'b0101110010110000; // NOT R12,R11
+    program_rom[ 29] = 16'b0011001100111100; // AND R3,R3,R12
+    program_rom[ 30] = 16'b0011110010111001; // AND R12,R11,R9
+    program_rom[ 31] = 16'b0010100010001100; // SUB R8,R8,R12
+    program_rom[ 32] = 16'b0110110010110010; // SHL R12,R11,2
+    program_rom[ 33] = 16'b0010100010001100; // SUB R8,R8,R12
+
+    program_rom[ 34] = 16'b1110110000010000; // IN R12,btn_r_event
+    program_rom[ 35] = 16'b0001000100011100; // ADD R1,R1,R12
+    program_rom[ 36] = 16'b0010000100010100; // SUB R1,R1,R4
+    program_rom[ 37] = 16'b0011000100010111; // AND R1,R1,R7
+    program_rom[ 38] = 16'b0001001000101000; // ADD R2,R2,R8
+
+    program_rom[ 39] = 16'b1010000000000010; // BLT R0,R2 -> 42
+    program_rom[ 40] = 16'b1100001000000000; // SETX R2,0
+    program_rom[ 41] = 16'b1101100000000000; // ADDI R8,R0,0
+    program_rom[ 42] = 16'b1010000000100101; // BLT R2,R5 -> 45
+    program_rom[ 43] = 16'b1100001001101100; // SETX R2,108
+    program_rom[ 44] = 16'b1101100000000000; // ADDI R8,R0,0
+    program_rom[ 45] = 16'b1011101110110000; // NOP
+    program_rom[ 46] = 16'b1011101110110000; // NOP
+    program_rom[ 47] = 16'b1011101110110000; // NOP
+
+    program_rom[ 48] = 16'b1101011011100001;
+    program_rom[ 49] = 16'b1100100100011110;
+    program_rom[ 50] = 16'b1101101100000000;
+    program_rom[ 51] = 16'b0110110010110101;
+    program_rom[ 52] = 16'b0001110011001110;
+    program_rom[ 53] = 16'b0000000111001101;
+    program_rom[ 54] = 16'b1101101110110001;
+    program_rom[ 55] = 16'b1011101110110000;
+    program_rom[ 56] = 16'b1011101110110000;
+    program_rom[ 57] = 16'b1010000010111001;
+    program_rom[ 58] = 16'b0001101111011101;
+    program_rom[ 59] = 16'b0110110011110101;
+    program_rom[ 60] = 16'b0001110011001110;
+    program_rom[ 61] = 16'b0000000111001011;
+    program_rom[ 62] = 16'b1100100100011110;
+    program_rom[ 63] = 16'b1101101100000000;
+    program_rom[ 64] = 16'b0110110010110101;
+    program_rom[ 65] = 16'b0001110011000110;
+    program_rom[ 66] = 16'b0000000111001101;
+    program_rom[ 67] = 16'b1101101110110001;
+    program_rom[ 68] = 16'b1011101110110000;
+    program_rom[ 69] = 16'b1011101110110000;
+    program_rom[ 70] = 16'b1010000010111001;
+    program_rom[ 71] = 16'b0001101111011101;
+    program_rom[ 72] = 16'b0110110011110101;
+    program_rom[ 73] = 16'b0001110011000110;
+    program_rom[ 74] = 16'b0000000111001011;
+    program_rom[ 75] = 16'b1101011011100010;
+    program_rom[ 76] = 16'b0011011001100111;
+    program_rom[ 77] = 16'b1100100100011110;
+    program_rom[ 78] = 16'b1101101100000000;
+    program_rom[ 79] = 16'b0110110010110101;
+    program_rom[ 80] = 16'b0001110011000110;
+    program_rom[ 81] = 16'b0000000111000000;
+    program_rom[ 82] = 16'b1101101110110001;
+    program_rom[ 83] = 16'b1011101110110000;
+    program_rom[ 84] = 16'b1011101110110000;
+    program_rom[ 85] = 16'b1010000010111001;
+    program_rom[ 86] = 16'b1101011011100011;
+    program_rom[ 87] = 16'b0011011001100111;
+    program_rom[ 88] = 16'b1100100100011110;
+    program_rom[ 89] = 16'b1101101100000000;
+    program_rom[ 90] = 16'b0110110010110101;
+    program_rom[ 91] = 16'b0001110011000110;
+    program_rom[ 92] = 16'b0000000111000000;
+    program_rom[ 93] = 16'b1101101110110001;
+    program_rom[ 94] = 16'b1011101110110000;
+    program_rom[ 95] = 16'b1011101110110000;
+    program_rom[ 96] = 16'b1010000010111001;
+
+    program_rom[ 97] = 16'b0001111111111101; // ADD R15,R15,R13
+    program_rom[ 98] = 16'b0111011011110010; // SHR R6,R15,2
+    program_rom[ 99] = 16'b0011110001101101; // AND R12,R6,R13
+    program_rom[100] = 16'b0110101111000010; // SHL R11,R12,2
+    program_rom[101] = 16'b0010111111111011; // SUB R15,R15,R11
+    program_rom[102] = 16'b0010111011101100; // SUB R14,R14,R12
+    program_rom[103] = 16'b0011111011100111; // AND R14,R14,R7
+
+    program_rom[104] = 16'b1000000000001000; // JMP 8
+end
+
+// ============================================================================
+// Register / PC init
+// ============================================================================
+
+integer ri;
+initial begin
+    pc = 8'd0;
+    for (ri = 0; ri < 16; ri = ri + 1)
+        registers[ri] = 16'd0;
+end
+
+// ============================================================================
+// CPU decode
+// ============================================================================
+
+wire [15:0] instr_w    = program_rom[pc];
+wire [3:0]  opcode     = instr_w[15:12];
+wire [3:0]  rd         = instr_w[11:8];
+wire [3:0]  rs1        = instr_w[7:4];
+wire [3:0]  rs2_or_imm = instr_w[3:0];
+wire [7:0]  imm8       = instr_w[7:0];
+wire [11:0] addr12     = instr_w[11:0];
+
+wire signed [7:0]  br_offs   = {{4{rs2_or_imm[3]}}, rs2_or_imm};
+wire signed [15:0] s_rs1_val = registers[rs1];
+
+reg [1:0] cpu_cnt = 0;
+wire cpu_tick = (cpu_cnt == 2'd3);
+always @(posedge clk)
+    cpu_cnt <= (rst || cpu_tick) ? 2'd0 : (cpu_cnt + 2'd1);
+
+// ============================================================================
+// One-shot button event management
+// ============================================================================
+
+always @(posedge clk) begin
+    prev_btn_l_d <= btn_l;
+    prev_btn_r_d <= btn_r;
+    prev_btn_u_d <= btn_u;
+
+    if (btn_l & ~prev_btn_l_d) btn_l_event <= 1'b1;
+    if (btn_r & ~prev_btn_r_d) btn_r_event <= 1'b1;
+    if (btn_u & ~prev_btn_u_d) btn_u_event <= 1'b1;
+
+    if (rst) begin
+        btn_l_event <= 1'b0;
+        btn_r_event <= 1'b0;
+        btn_u_event <= 1'b0;
+    end else if (cpu_tick && !splash_mode && opcode == 4'b1110) begin
+        if (rs1 == 4'b0010) btn_l_event <= 1'b0;
+        if (rs1 == 4'b0001) btn_r_event <= 1'b0;
+        if (rs1 == 4'b0100) btn_u_event <= 1'b0;
+    end
+end
+
+// ============================================================================
+// CPU execute
+// ============================================================================
+
+always @(posedge clk) begin
+    if (rst) begin
+        pc <= 8'd0;
+        for (ri = 0; ri < 16; ri = ri + 1)
+            registers[ri] <= 16'd0;
+    end else if (cpu_tick && !splash_mode) begin
+        case (opcode)
+            4'b0000: begin
+                case (rd)
+                    4'b0001: if (registers[rs1] < 16'd960)
+                                tilemap[registers[rs1][9:0]] <= registers[rs2_or_imm][4:0];
+                    4'b0010: if (registers[rs1] < 16'd8)
+                                sprite_table[registers[rs1][2:0]] <= registers[rs2_or_imm];
+                    4'b0011: if (registers[rs1] < 16'd512)
+                                tile_gfx[registers[rs1][8:0]] <= registers[rs2_or_imm][3:0];
+                    4'b0100: if (registers[rs1] < 16'd16)
+                                palette[registers[rs1][3:0]] <= registers[rs2_or_imm][11:0];
+                    default: ;
+                endcase
+                pc <= pc + 8'd1;
+            end
+            4'b0001: begin registers[rd] <= registers[rs1] + registers[rs2_or_imm]; pc <= pc + 8'd1; end
+            4'b0010: begin registers[rd] <= registers[rs1] - registers[rs2_or_imm]; pc <= pc + 8'd1; end
+            4'b0011: begin registers[rd] <= registers[rs1] & registers[rs2_or_imm]; pc <= pc + 8'd1; end
+            4'b0100: begin registers[rd] <= registers[rs1] | registers[rs2_or_imm]; pc <= pc + 8'd1; end
+            4'b0101: begin registers[rd] <= ~registers[rs1];                         pc <= pc + 8'd1; end
+            4'b0110: begin registers[rd] <= registers[rs1] << rs2_or_imm;            pc <= pc + 8'd1; end
+            4'b0111: begin registers[rd] <= registers[rs1] >> rs2_or_imm;            pc <= pc + 8'd1; end
+            4'b1000: begin pc <= addr12[7:0]; end
+            4'b1001: begin
+                if (registers[rd] == registers[rs2_or_imm]) pc <= pc + 8'd1 + br_offs;
+                else                                        pc <= pc + 8'd1;
+            end
+            4'b1010: begin
+                if (s_rs1_val < $signed(registers[rs2_or_imm])) pc <= pc + 8'd1 + br_offs;
+                else                                             pc <= pc + 8'd1;
+            end
+            4'b1011: begin pc <= pc + 8'd1; end
+            4'b1100: begin registers[rd] <= {8'h00, imm8};                                       pc <= pc + 8'd1; end
+            4'b1101: begin registers[rd] <= registers[rs1] + {{12{rs2_or_imm[3]}}, rs2_or_imm}; pc <= pc + 8'd1; end
+            4'b1110: begin
+                case (rs1)
+                    4'b0001: registers[rd] <= {15'b0, btn_r_event};
+                    4'b0010: registers[rd] <= {15'b0, btn_l_event};
+                    4'b0011: registers[rd] <= {15'b0, btn_d};
+                    4'b0100: registers[rd] <= {15'b0, btn_u_event};
+                    default: registers[rd] <= {15'b0, vsync_r};
+                endcase
+                pc <= pc + 8'd1;
+            end
+            4'b1111: begin pc <= pc; end
+            default: begin pc <= pc + 8'd1; end
+        endcase
+
+        // Clamp upward velocity (max jump speed)
+        if ($signed(registers[8]) < -4)
+            registers[8] <= 16'hFFFC;
+        // Terminal velocity cap - prevents runaway falling
+        if ($signed(registers[8]) > 6)
+            registers[8] <= 16'd6;
+        // R0 always zero
+        registers[0] <= 16'd0;
+    end
+end
+
+endmodule
